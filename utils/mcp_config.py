@@ -48,10 +48,32 @@ class McpConfigManager:
         repo = "-".join(segments[: idx + 1])
         return f"{owner}/{repo}"
 
+    @staticmethod
+    def _is_valid_token(token: Optional[str]) -> bool:
+        """Check if a token is a real token (not blank or placeholder)."""
+        if not token or not token.strip():
+            return False
+        # Reject common placeholder values
+        placeholders = {"cl_your_token_here", "cl_...", "cl_"}
+        return token.strip() not in placeholders and token.startswith("cl_") and len(token) > 4
+
+    def get_configured_repos(self) -> set:
+        """Return the set of repos that have valid (non-placeholder) tokens."""
+        return {
+            repo for repo, token in self.registry.get("repos", {}).items()
+            if self._is_valid_token(token)
+        }
+
     def get_token(self, instance_id: str) -> Optional[str]:
-        """Get the MCP token for the repo in this instance."""
+        """Get the MCP token for the repo in this instance.
+
+        Returns None if the token is missing, blank, or a placeholder.
+        """
         repo = self.repo_from_instance_id(instance_id)
-        return self.registry.get("repos", {}).get(repo)
+        token = self.registry.get("repos", {}).get(repo)
+        if not self._is_valid_token(token):
+            return None
+        return token
 
     def inject_mcp_json(self, instance_id: str, task_dir: str) -> bool:
         """Write .mcp.json into the task directory.

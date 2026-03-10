@@ -69,8 +69,8 @@ class CodeSWEAgent:
         # Repo filtering
         self.repos_filter = None
         if mcp_repos_only and self.mcp_manager:
-            # Derive filter from repos that have tokens configured
-            configured_repos = set(self.mcp_manager.registry.get("repos", {}).keys())
+            # Derive filter from repos that have valid (non-placeholder) tokens
+            configured_repos = self.mcp_manager.get_configured_repos()
             if repos_filter:
                 # Intersect: only repos that are both requested AND have tokens
                 self.repos_filter = configured_repos & set(repos_filter)
