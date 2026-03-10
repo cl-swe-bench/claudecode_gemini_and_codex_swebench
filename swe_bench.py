@@ -40,6 +40,7 @@ def run_command(args):
     runner = EnhancedBenchmarkRunner(
         model=args.model if hasattr(args, 'model') else None,
         backend=args.backend if hasattr(args, 'backend') and args.backend else DEFAULT_BACKEND,
+        mcp_enabled=args.mcp if hasattr(args, 'mcp') else False,
     )
     
     # Set default limit if not specified
@@ -66,6 +67,8 @@ def run_command(args):
         model_name = get_model_name(args.model, runner.backend) if args.model else None
         print(f"Model: {args.model} -> {model_name}")
     print(f"Backend: {runner.backend}")
+    mcp_status = getattr(args, 'mcp', False)
+    print(f"MCP: {'ENABLED (Code Lexica)' if mcp_status else 'DISABLED'}")
     print(f"Evaluation: {'DISABLED' if args.no_eval else 'ENABLED'}")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -376,6 +379,7 @@ Examples:
     run_parser.add_argument('--notes', default='', help='Optional notes about this run')
     run_parser.add_argument('--model', type=str, help='Model to use (e.g., opus-4.1, codex-4.2)')
     run_parser.add_argument('--backend', type=str, choices=['claude', 'codex', 'gemini'], help='Code model backend')
+    run_parser.add_argument('--mcp', action='store_true', help='Enable Code Lexica MCP server for codebase context')
     
     # EVAL command
     eval_parser = subparsers.add_parser('eval', help='Evaluate past predictions')
@@ -423,6 +427,7 @@ Examples:
         args.standard = False
         args.full = True
         args.model = None
+        args.mcp = False
     
     # Route to appropriate handler
     if args.command == 'run':
@@ -445,6 +450,7 @@ Examples:
             standard = False
             full = False
             model = None
+            mcp = False
         return run_command(QuickArgs())
     elif args.command == 'full':
         # Create args for full command
@@ -458,6 +464,7 @@ Examples:
             standard = False
             full = True
             model = None
+            mcp = False
         return run_command(FullArgs())
     elif args.command == 'check':
         # Create args for check command

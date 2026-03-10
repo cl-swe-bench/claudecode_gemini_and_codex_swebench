@@ -56,6 +56,9 @@ output.txt
 **/.tmp
 tmp/
 
+# Code Lexica MCP tokens
+configs/code_lexica_repos.json
+
 # Files that commonly contain secrets
 **/*.key
 **/*.pem

@@ -16,7 +16,7 @@ import jsonlines
 from datasets import load_dataset
 
 class EnhancedBenchmarkRunner:
-    def __init__(self, model=None, backend="claude"):
+    def __init__(self, model=None, backend="claude", mcp_enabled=False):
         self.base_dir = Path.cwd()
         self.log_file = self.base_dir / "benchmark_scores.log"
         self.predictions_dir = self.base_dir / "predictions"
@@ -24,6 +24,7 @@ class EnhancedBenchmarkRunner:
         self.eval_results_dir = self.base_dir / "evaluation_results"
         self.model = model
         self.backend = backend
+        self.mcp_enabled = mcp_enabled
         
         # Create directories
         self.predictions_dir.mkdir(exist_ok=True)
@@ -48,6 +49,7 @@ class EnhancedBenchmarkRunner:
             "evaluation_time": evaluation_time,
             "model": self.model,
             "backend": self.backend,
+            "mcp_enabled": self.mcp_enabled,
             "notes": notes
         }
         
@@ -66,7 +68,8 @@ class EnhancedBenchmarkRunner:
     def run_inference(self, dataset_name, limit):
         """Run code model on the dataset"""
         model_info = f" with model {self.model}" if self.model else ""
-        print(f"\n🚀 Running {self.backend.title()} Code{model_info} on {dataset_name} (limit: {limit})...")
+        mcp_info = " + MCP" if self.mcp_enabled else ""
+        print(f"\n🚀 Running {self.backend.title()} Code{model_info}{mcp_info} on {dataset_name} (limit: {limit})...")
 
         cmd = [
             sys.executable,
@@ -78,6 +81,9 @@ class EnhancedBenchmarkRunner:
 
         if self.model:
             cmd.extend(["--model", self.model])
+
+        if self.mcp_enabled:
+            cmd.append("--mcp")
         
         try:
             start_time = time.time()

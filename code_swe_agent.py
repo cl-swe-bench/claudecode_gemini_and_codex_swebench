@@ -24,6 +24,7 @@ from utils.gemini_interface import GeminiCodeInterface
 from utils.prompt_formatter import PromptFormatter
 from utils.patch_extractor import PatchExtractor
 from utils.model_registry import get_model_name
+from utils.mcp_config import McpConfigManager
 
 
 DEFAULT_BACKEND = os.environ.get("CODE_SWE_BACKEND", "claude")
@@ -34,7 +35,8 @@ class CodeSWEAgent:
 
     def __init__(self, prompt_template: Optional[str] = None,
                  model: Optional[str] = None,
-                 backend: str = DEFAULT_BACKEND):
+                 backend: str = DEFAULT_BACKEND,
+                 mcp_enabled: bool = False):
         self.backend = (backend or DEFAULT_BACKEND).lower()
         if self.backend == "codex":
             self.interface = CodexCodeInterface()
@@ -53,6 +55,13 @@ class CodeSWEAgent:
         # Resolve model name from alias
         self.model = get_model_name(model, self.backend) if model else None
         self.model_alias = model  # Keep original alias for logging
+
+        # MCP configuration
+        self.mcp_enabled = mcp_enabled
+        self.mcp_manager = None
+        if mcp_enabled:
+            self.mcp_manager = McpConfigManager()
+            print("MCP mode enabled — Code Lexica context will be injected per repo")
 
         # Create directories if they don't exist
         self.results_dir.mkdir(exist_ok=True)
@@ -134,6 +143,12 @@ class CodeSWEAgent:
             }
 
         try:
+            # Inject or remove MCP config before running the agent
+            if self.mcp_enabled and self.mcp_manager:
+                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
+            else:
+                McpConfigManager.remove_mcp_json(repo_path)
+
             prompt = self.prompt_formatter.format_for_cli(instance)
 
             os.chdir(repo_path)
@@ -272,9 +287,11 @@ def main():
                        help="Model to use (e.g., opus-4.1, codex-4.2, or any name)")
     parser.add_argument("--backend", type=str, choices=["claude", "codex", "gemini"],
                        help="Code model backend to use")
-    
+    parser.add_argument("--mcp", action="store_true",
+                       help="Enable Code Lexica MCP server for codebase context")
+
     args = parser.parse_args()
-    
+
     backend = args.backend or DEFAULT_BACKEND
 
     # Check if selected CLI is available
@@ -294,7 +311,7 @@ def main():
         print(f"Error: {cli_cmd} CLI not found. Please ensure '{cli_cmd}' is installed and in PATH")
         sys.exit(1)
 
-    agent = CodeSWEAgent(args.prompt_template, args.model, backend)
+    agent = CodeSWEAgent(args.prompt_template, args.model, backend, mcp_enabled=args.mcp)
     
     # Run on specific instance or dataset
     if args.instance_id:

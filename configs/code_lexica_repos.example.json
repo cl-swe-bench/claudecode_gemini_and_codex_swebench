@@ -1,0 +1,17 @@
+{
+  "mcp_url": "https://api.codelexica.com/mcp",
+  "repos": {
+    "django/django": "cl_your_token_here",
+    "scikit-learn/scikit-learn": "cl_your_token_here",
+    "matplotlib/matplotlib": "cl_your_token_here",
+    "sympy/sympy": "cl_your_token_here",
+    "pytest-dev/pytest": "cl_your_token_here",
+    "pallets/flask": "cl_your_token_here",
+    "psf/requests": "cl_your_token_here",
+    "astropy/astropy": "cl_your_token_here",
+    "pydata/xarray": "cl_your_token_here",
+    "sphinx-doc/sphinx": "cl_your_token_here",
+    "pylint-dev/pylint": "cl_your_token_here",
+    "mwaskom/seaborn": "cl_your_token_here"
+  }
+}
