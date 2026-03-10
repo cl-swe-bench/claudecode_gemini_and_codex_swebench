@@ -40,7 +40,8 @@ class ClaudeCodeInterface:
             os.chdir(cwd)
 
             # Build command with optional model parameter
-            cmd = ["claude", "--dangerously-skip-permissions"]
+            # Use -p (print mode) with --output-format json for structured output
+            cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
             if model:
                 cmd.extend(["--model", model])
 
@@ -56,11 +57,49 @@ class ClaudeCodeInterface:
             # Restore original directory
             os.chdir(original_cwd)
 
+            # Parse JSON output for token usage and metadata
+            # Claude Code -p --output-format json returns:
+            # {
+            #   "result": "...", "num_turns": N, "duration_ms": N,
+            #   "duration_api_ms": N, "is_error": bool, "session_id": "...",
+            #   "total_cost_usd": N.NN,
+            #   "usage": { "input_tokens": N, "output_tokens": N,
+            #              "cache_creation_input_tokens": N, "cache_read_input_tokens": N }
+            # }
+            token_usage = {}
+            if result.stdout:
+                try:
+                    output_data = json.loads(result.stdout)
+                    if isinstance(output_data, dict):
+                        usage = output_data.get("usage") or {}
+                        input_tokens = usage.get("input_tokens", 0)
+                        output_tokens = usage.get("output_tokens", 0)
+                        token_usage = {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                            "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
+                            "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
+                        }
+                        if output_data.get("total_cost_usd") is not None:
+                            token_usage["cost_usd"] = output_data["total_cost_usd"]
+                        if output_data.get("num_turns") is not None:
+                            token_usage["num_turns"] = output_data["num_turns"]
+                        if output_data.get("duration_ms") is not None:
+                            token_usage["duration_ms"] = output_data["duration_ms"]
+                        if output_data.get("duration_api_ms") is not None:
+                            token_usage["duration_api_ms"] = output_data["duration_api_ms"]
+                        if output_data.get("session_id") is not None:
+                            token_usage["session_id"] = output_data["session_id"]
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass  # Fall back to no token tracking
+
             return {
                 "success": result.returncode == 0,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "returncode": result.returncode,
+                "token_usage": token_usage,
             }
 
         except subprocess.TimeoutExpired:
@@ -70,6 +109,7 @@ class ClaudeCodeInterface:
                 "stdout": "",
                 "stderr": "Command timed out after 10 minutes",
                 "returncode": -1,
+                "token_usage": {},
             }
         except Exception as e:
             os.chdir(original_cwd)
@@ -78,6 +118,7 @@ class ClaudeCodeInterface:
                 "stdout": "",
                 "stderr": str(e),
                 "returncode": -1,
+                "token_usage": {},
             }
 
     def extract_file_changes(self, response: str) -> List[Dict[str, str]]:

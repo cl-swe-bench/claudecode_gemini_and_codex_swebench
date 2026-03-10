@@ -162,6 +162,7 @@ class CodeSWEAgent:
                 "model": f"{self.backend}-code",
                 "prediction": "",
                 "error": "Failed to set up repository",
+                "token_usage": {},
             }
 
         try:
@@ -181,6 +182,8 @@ class CodeSWEAgent:
             print(f"Running {self.backend.title()} Code{model_info}...")
             result = self.interface.execute_code_cli(prompt, repo_path, self.model)
 
+            token_usage = result.get("token_usage", {})
+
             if not result["success"]:
                 print(f"{self.backend.title()} Code execution failed: {result['stderr']}")
                 os.chdir(original_dir)
@@ -189,8 +192,10 @@ class CodeSWEAgent:
                     "model": self.model_alias or f"{self.backend}-code",
                     "prediction": "",
                     "error": f"Execution failed: {result['stderr']}",
+                    "token_usage": token_usage,
                 }
 
+            # Extract patch from git diff (works regardless of output format)
             patch = self.patch_extractor.extract_from_cli_output(result["stdout"], repo_path)
 
             is_valid, error = self.patch_extractor.validate_patch(patch)
@@ -201,6 +206,7 @@ class CodeSWEAgent:
             prediction = self.patch_extractor.format_for_swebench(
                 patch, instance_id, self.model_alias or f"{self.backend}-code"
             )
+            prediction["token_usage"] = token_usage
 
             self._save_result(instance_id, result, patch)
 
@@ -215,6 +221,7 @@ class CodeSWEAgent:
                 "model": self.model_alias or f"{self.backend}-code",
                 "prediction": "",
                 "error": str(e),
+                "token_usage": {},
             }
         finally:
             try:
@@ -228,12 +235,19 @@ class CodeSWEAgent:
         """Save detailed results for debugging."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         result_file = self.results_dir / f"{instance_id}_{timestamp}.json"
-        
+
         with open(result_file, 'w') as f:
             json.dump({
                 "instance_id": instance_id,
                 "timestamp": timestamp,
-                "claude_output": result,
+                "token_usage": result.get("token_usage", {}),
+                "claude_output": {
+                    "success": result.get("success"),
+                    "returncode": result.get("returncode"),
+                    "stderr": result.get("stderr", ""),
+                    # Truncate stdout to avoid huge files (JSON output can be large)
+                    "stdout_length": len(result.get("stdout", "")),
+                },
                 "extracted_patch": patch
             }, f, indent=2)
             
@@ -267,13 +281,73 @@ class CodeSWEAgent:
             json_file.unlink()
 
         predictions: List[Dict] = []
+        total = len(dataset)
+        patches_generated = 0
+        total_tokens = 0
+        total_cost = 0.0
 
-        for instance in tqdm(dataset, desc="Processing instances"):
+        for idx, instance in enumerate(dataset, 1):
+            instance_id = instance["instance_id"]
+            repo = instance["repo"]
+            elapsed = (datetime.now() - datetime.strptime(self.pred_timestamp, "%Y%m%d_%H%M%S")).total_seconds()
+            avg_time = elapsed / (idx - 1) if idx > 1 else 0
+            remaining = avg_time * (total - idx + 1)
+
+            print(f"\n{'='*60}")
+            print(f"[{idx}/{total}] {instance_id}")
+            print(f"  Repo: {repo}")
+            if idx > 1:
+                print(f"  Avg time/task: {avg_time:.0f}s | Est. remaining: {remaining/60:.1f}m")
+                print(f"  Patches so far: {patches_generated}/{idx-1} ({patches_generated/(idx-1)*100:.0f}%)")
+                stats_parts = []
+                if total_tokens > 0:
+                    stats_parts.append(f"Tokens: {total_tokens:,}")
+                if total_cost > 0:
+                    stats_parts.append(f"Cost: ${total_cost:.2f}")
+                if stats_parts:
+                    print(f"  Running totals: {' | '.join(stats_parts)}")
+            print(f"{'='*60}")
+
             prediction = self.process_instance(instance)
-            predictions.append(prediction)
 
-            # Save prediction incrementally
+            has_patch = bool(prediction.get("prediction", "").strip())
+            if has_patch:
+                patches_generated += 1
+
+            # Accumulate token usage if available
+            task_usage = prediction.get("token_usage", {})
+            task_tokens = task_usage.get("total_tokens", 0)
+            task_cost = task_usage.get("cost_usd", 0) or 0
+            task_turns = task_usage.get("num_turns")
+            task_duration = task_usage.get("duration_ms")
+            total_tokens += task_tokens
+            total_cost += task_cost
+
+            # Per-task result summary
+            status = "PATCH" if has_patch else "NO PATCH"
+            details = [status]
+            if task_tokens:
+                details.append(f"{task_tokens:,} tokens")
+            if task_cost:
+                details.append(f"${task_cost:.3f}")
+            if task_turns:
+                details.append(f"{task_turns} turns")
+            if task_duration:
+                details.append(f"{task_duration/1000:.1f}s")
+            print(f"  Result: {' | '.join(details)}")
+
+            predictions.append(prediction)
             self._save_predictions(prediction)
+
+        print(f"\n{'='*60}")
+        print(f"GENERATION COMPLETE")
+        print(f"  Tasks: {total}")
+        print(f"  Patches: {patches_generated}/{total} ({patches_generated/total*100:.0f}%)")
+        if total_tokens > 0:
+            print(f"  Total tokens: {total_tokens:,} (avg {total_tokens//total:,}/task)")
+        if total_cost > 0:
+            print(f"  Total cost: ${total_cost:.2f} (avg ${total_cost/total:.3f}/task)")
+        print(f"{'='*60}")
 
         with open(json_file, 'w') as f:
             json.dump(predictions, f, indent=2)
