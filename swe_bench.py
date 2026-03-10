@@ -37,10 +37,18 @@ from code_swe_agent import DEFAULT_BACKEND
 
 def run_command(args):
     """Handle 'run' subcommand - run new benchmarks"""
+    # Parse repos filter
+    repos_filter = None
+    repos_arg = getattr(args, 'repos', None)
+    if repos_arg:
+        repos_filter = [r.strip() for r in repos_arg.split(",") if r.strip()]
+
     runner = EnhancedBenchmarkRunner(
         model=args.model if hasattr(args, 'model') else None,
         backend=args.backend if hasattr(args, 'backend') and args.backend else DEFAULT_BACKEND,
-        mcp_enabled=args.mcp if hasattr(args, 'mcp') else False,
+        mcp_enabled=getattr(args, 'mcp', False),
+        repos_filter=repos_filter,
+        mcp_repos_only=getattr(args, 'mcp_repos_only', False),
     )
     
     # Set default limit if not specified
@@ -69,6 +77,10 @@ def run_command(args):
     print(f"Backend: {runner.backend}")
     mcp_status = getattr(args, 'mcp', False)
     print(f"MCP: {'ENABLED (Code Lexica)' if mcp_status else 'DISABLED'}")
+    if repos_filter:
+        print(f"Repos filter: {', '.join(repos_filter)}")
+    if getattr(args, 'mcp_repos_only', False):
+        print(f"MCP repos only: ENABLED")
     print(f"Evaluation: {'DISABLED' if args.no_eval else 'ENABLED'}")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -380,6 +392,8 @@ Examples:
     run_parser.add_argument('--model', type=str, help='Model to use (e.g., opus-4.1, codex-4.2)')
     run_parser.add_argument('--backend', type=str, choices=['claude', 'codex', 'gemini'], help='Code model backend')
     run_parser.add_argument('--mcp', action='store_true', help='Enable Code Lexica MCP server for codebase context')
+    run_parser.add_argument('--repos', type=str, help='Comma-separated list of repos to run (e.g., django/django,sympy/sympy)')
+    run_parser.add_argument('--mcp-repos-only', action='store_true', help='Only run on repos with MCP tokens configured')
     
     # EVAL command
     eval_parser = subparsers.add_parser('eval', help='Evaluate past predictions')
@@ -428,7 +442,9 @@ Examples:
         args.full = True
         args.model = None
         args.mcp = False
-    
+        args.repos = None
+        args.mcp_repos_only = False
+
     # Route to appropriate handler
     if args.command == 'run':
         return run_command(args)
@@ -451,6 +467,8 @@ Examples:
             full = False
             model = None
             mcp = False
+            repos = None
+            mcp_repos_only = False
         return run_command(QuickArgs())
     elif args.command == 'full':
         # Create args for full command
@@ -465,6 +483,8 @@ Examples:
             full = True
             model = None
             mcp = False
+            repos = None
+            mcp_repos_only = False
         return run_command(FullArgs())
     elif args.command == 'check':
         # Create args for check command

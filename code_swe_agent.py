@@ -36,7 +36,9 @@ class CodeSWEAgent:
     def __init__(self, prompt_template: Optional[str] = None,
                  model: Optional[str] = None,
                  backend: str = DEFAULT_BACKEND,
-                 mcp_enabled: bool = False):
+                 mcp_enabled: bool = False,
+                 repos_filter: Optional[List[str]] = None,
+                 mcp_repos_only: bool = False):
         self.backend = (backend or DEFAULT_BACKEND).lower()
         if self.backend == "codex":
             self.interface = CodexCodeInterface()
@@ -59,9 +61,29 @@ class CodeSWEAgent:
         # MCP configuration
         self.mcp_enabled = mcp_enabled
         self.mcp_manager = None
-        if mcp_enabled:
+        if mcp_enabled or mcp_repos_only:
             self.mcp_manager = McpConfigManager()
-            print("MCP mode enabled — Code Lexica context will be injected per repo")
+            if mcp_enabled:
+                print("MCP mode enabled — Code Lexica context will be injected per repo")
+
+        # Repo filtering
+        self.repos_filter = None
+        if mcp_repos_only and self.mcp_manager:
+            # Derive filter from repos that have tokens configured
+            configured_repos = set(self.mcp_manager.registry.get("repos", {}).keys())
+            if repos_filter:
+                # Intersect: only repos that are both requested AND have tokens
+                self.repos_filter = configured_repos & set(repos_filter)
+            else:
+                self.repos_filter = configured_repos
+            print(f"MCP repos filter: {len(self.repos_filter)} repos with tokens configured")
+            for repo in sorted(self.repos_filter):
+                print(f"  - {repo}")
+        elif repos_filter:
+            self.repos_filter = set(repos_filter)
+            print(f"Repo filter: {len(self.repos_filter)} repos selected")
+            for repo in sorted(self.repos_filter):
+                print(f"  - {repo}")
 
         # Create directories if they don't exist
         self.results_dir.mkdir(exist_ok=True)
@@ -220,10 +242,22 @@ class CodeSWEAgent:
         """Run on a full dataset."""
         print(f"Loading dataset: {dataset_name}")
         dataset = load_dataset(dataset_name, split=split)
-        
+
+        # Filter by repos if specified
+        if self.repos_filter:
+            original_count = len(dataset)
+            dataset = dataset.filter(
+                lambda instance: instance["repo"] in self.repos_filter
+            )
+            print(f"Repo filter: {len(dataset)}/{original_count} instances match selected repos")
+
         if limit:
             dataset = dataset.select(range(min(limit, len(dataset))))
-            
+
+        if len(dataset) == 0:
+            print("No instances to process after filtering.")
+            return []
+
         self.pred_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.pred_file = self.predictions_dir / f"predictions_{self.pred_timestamp}.jsonl"
         if self.pred_file.exists():
@@ -289,6 +323,10 @@ def main():
                        help="Code model backend to use")
     parser.add_argument("--mcp", action="store_true",
                        help="Enable Code Lexica MCP server for codebase context")
+    parser.add_argument("--repos", type=str,
+                       help="Comma-separated list of repos to run (e.g., django/django,sympy/sympy)")
+    parser.add_argument("--mcp-repos-only", action="store_true",
+                       help="Only run on repos that have MCP tokens configured in code_lexica_repos.json")
 
     args = parser.parse_args()
 
@@ -311,7 +349,17 @@ def main():
         print(f"Error: {cli_cmd} CLI not found. Please ensure '{cli_cmd}' is installed and in PATH")
         sys.exit(1)
 
-    agent = CodeSWEAgent(args.prompt_template, args.model, backend, mcp_enabled=args.mcp)
+    # Parse repos filter
+    repos_filter = None
+    if args.repos:
+        repos_filter = [r.strip() for r in args.repos.split(",") if r.strip()]
+
+    agent = CodeSWEAgent(
+        args.prompt_template, args.model, backend,
+        mcp_enabled=args.mcp,
+        repos_filter=repos_filter,
+        mcp_repos_only=args.mcp_repos_only,
+    )
     
     # Run on specific instance or dataset
     if args.instance_id:

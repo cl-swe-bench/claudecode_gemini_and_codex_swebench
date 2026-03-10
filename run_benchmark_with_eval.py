@@ -16,7 +16,8 @@ import jsonlines
 from datasets import load_dataset
 
 class EnhancedBenchmarkRunner:
-    def __init__(self, model=None, backend="claude", mcp_enabled=False):
+    def __init__(self, model=None, backend="claude", mcp_enabled=False,
+                 repos_filter=None, mcp_repos_only=False):
         self.base_dir = Path.cwd()
         self.log_file = self.base_dir / "benchmark_scores.log"
         self.predictions_dir = self.base_dir / "predictions"
@@ -25,6 +26,8 @@ class EnhancedBenchmarkRunner:
         self.model = model
         self.backend = backend
         self.mcp_enabled = mcp_enabled
+        self.repos_filter = repos_filter
+        self.mcp_repos_only = mcp_repos_only
         
         # Create directories
         self.predictions_dir.mkdir(exist_ok=True)
@@ -50,6 +53,8 @@ class EnhancedBenchmarkRunner:
             "model": self.model,
             "backend": self.backend,
             "mcp_enabled": self.mcp_enabled,
+            "repos_filter": list(self.repos_filter) if self.repos_filter else None,
+            "mcp_repos_only": self.mcp_repos_only,
             "notes": notes
         }
         
@@ -84,7 +89,13 @@ class EnhancedBenchmarkRunner:
 
         if self.mcp_enabled:
             cmd.append("--mcp")
-        
+
+        if self.repos_filter:
+            cmd.extend(["--repos", ",".join(self.repos_filter)])
+
+        if self.mcp_repos_only:
+            cmd.append("--mcp-repos-only")
+
         try:
             start_time = time.time()
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)  # 2 hour timeout
