@@ -48,10 +48,12 @@ GEMINI_EXPECTED = {
 # Claude models
 CLAUDE_MODELS: Dict[str, str] = {
     # Opus models (most capable)
+    "claude-opus-4.6": "claude-opus-4-6",
     "claude-opus-4.1": "claude-opus-4-1-20250805",
     "claude-opus-4.0": "claude-opus-4-20250514",
 
     # Sonnet models
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
     "claude-sonnet-4.5": "claude-sonnet-4-5-20250929",
     "claude-sonnet-4.0": "claude-sonnet-4-20250514",
     "claude-3.7-sonnet": "claude-3-7-sonnet-20250219",
@@ -61,35 +63,41 @@ CLAUDE_MODELS: Dict[str, str] = {
     "claude-3.5-haiku": "claude-3-5-haiku-20241022",
 
     # Aliases
+    "opus-4.6": "claude-opus-4.6",
     "opus-4.1": "claude-opus-4.1",
     "opus-4.0": "claude-opus-4.0",
+    "sonnet-4.6": "claude-sonnet-4.6",
     "sonnet-4.5": "claude-sonnet-4.5",
     "sonnet-4": "claude-sonnet-4.0",
     "sonnet-3.7": "claude-3.7-sonnet",
-    "best": "claude-sonnet-4.5", # Or Opus 4.1 depending on preference, user said "newest Opus or Sonnet 4.5"
-    "balanced": "claude-sonnet-4.0",
+    "best": "claude-opus-4.6",
+    "balanced": "claude-sonnet-4.6",
     "fast": "claude-haiku-4.5",
-    "latest": "claude-sonnet-4.5",
+    "latest": "claude-opus-4.6",
 }
 
 CLAUDE_DESCRIPTIONS = {
-    "claude-opus-4.1": "Opus 4.1 - Latest and most capable",
-    "claude-opus-4.0": "Opus 4.0 - Very strong performance",
-    "claude-sonnet-4.5": "Sonnet 4.5 - State of the art balanced model",
-    "claude-sonnet-4.0": "Sonnet 4.0 - Strong balanced model",
+    "claude-opus-4.6": "Opus 4.6 - Latest and most capable",
+    "claude-opus-4.1": "Opus 4.1 - Very strong performance",
+    "claude-opus-4.0": "Opus 4.0 - Strong performance",
+    "claude-sonnet-4.6": "Sonnet 4.6 - Latest balanced model",
+    "claude-sonnet-4.5": "Sonnet 4.5 - Strong balanced model",
+    "claude-sonnet-4.0": "Sonnet 4.0 - Previous gen balanced model",
     "claude-haiku-4.5": "Haiku 4.5 - Fast and smart",
     "claude-3.7-sonnet": "Sonnet 3.7 - Reliable previous gen",
 }
 
 CLAUDE_CATEGORIES = {
-    "Opus Models (Most Capable)": ["claude-opus-4.1", "claude-opus-4.0"],
-    "Sonnet Models (Balanced)": ["claude-sonnet-4.5", "claude-sonnet-4.0", "claude-3.7-sonnet"],
+    "Opus Models (Most Capable)": ["claude-opus-4.6", "claude-opus-4.1", "claude-opus-4.0"],
+    "Sonnet Models (Balanced)": ["claude-sonnet-4.6", "claude-sonnet-4.5", "claude-sonnet-4.0", "claude-3.7-sonnet"],
     "Haiku Models (Fast)": ["claude-haiku-4.5", "claude-3.5-haiku"],
     "Quick Aliases": ["best", "balanced", "fast"],
 }
 
 CLAUDE_EXPECTED = {
+    "claude-opus-4.6": {"min": 40, "max": 50, "typical": 45},
     "claude-opus-4.1": {"min": 35, "max": 45, "typical": 40},
+    "claude-sonnet-4.6": {"min": 38, "max": 48, "typical": 43},
     "claude-sonnet-4.5": {"min": 35, "max": 45, "typical": 40},
     "claude-sonnet-4.0": {"min": 25, "max": 35, "typical": 30},
 }

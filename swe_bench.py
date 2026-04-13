@@ -29,6 +29,8 @@ def check_swebench_installed():
         print("but evaluation requires it to test if patches actually work.")
         return False
 
+import json
+
 from run_benchmark_with_eval import EnhancedBenchmarkRunner
 from evaluate_predictions import PredictionEvaluator
 from show_scores import ScoreViewer
@@ -341,6 +343,92 @@ def check_command(args):
     args.last = None
     return scores_command(args)
 
+def convert_pro_command(args):
+    """Convert predictions to ScaleAI SWE-bench Pro evaluation format."""
+    import jsonlines
+
+    input_path = Path(args.file)
+    if not input_path.exists():
+        # Try looking in predictions/ directory
+        input_path = Path("predictions") / args.file
+    if not input_path.exists():
+        print(f"File not found: {args.file}")
+        return 1
+
+    prefix = args.prefix or "claude-code"
+    predictions = []
+
+    # Support both JSONL and JSON input
+    if input_path.suffix == ".jsonl":
+        with jsonlines.open(input_path) as reader:
+            for obj in reader:
+                predictions.append(obj)
+    else:
+        with open(input_path) as f:
+            data = json.load(f)
+            predictions = data if isinstance(data, list) else [data]
+
+    # Convert to ScaleAI format: JSON array with {instance_id, patch, prefix}
+    converted = []
+    skipped = 0
+    for pred in predictions:
+        patch = pred.get("prediction", "")
+        if not patch.strip() and not args.include_empty:
+            skipped += 1
+            continue
+        converted.append({
+            "instance_id": pred["instance_id"],
+            "patch": patch,
+            "prefix": prefix,
+        })
+
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = input_path.with_name(
+            input_path.stem.replace("predictions_", "patches_pro_") + ".json"
+        )
+
+    with open(output_path, "w") as f:
+        json.dump(converted, f, indent=2)
+
+    print(f"Converted {len(converted)} predictions to ScaleAI Pro format")
+    if skipped:
+        print(f"Skipped {skipped} empty patches (use --include-empty to include them)")
+    print(f"Output: {output_path}")
+    print(f"\nTo evaluate with ScaleAI harness:")
+    print(f"  cd /path/to/SWE-bench_Pro-os")
+    print(f"  python swe_bench_pro_eval.py \\")
+    print(f"    --raw_sample_path helper_code/sweap_eval_full_v2.jsonl \\")
+    print(f"    --patch_path {output_path.resolve()} \\")
+    print(f"    --output_dir eval_output \\")
+    print(f"    --scripts_dir run_scripts \\")
+    print(f"    --dockerhub_username <your_username> \\")
+    print(f"    --use_local_docker")
+    return 0
+
+
+def export_dataset_command(args):
+    """Export a HuggingFace dataset to local JSONL for ScaleAI evaluation."""
+    from datasets import load_dataset
+
+    dataset_name = args.dataset
+    split = args.split or "test"
+
+    print(f"Loading dataset: {dataset_name} (split: {split})")
+    dataset = load_dataset(dataset_name, split=split)
+
+    if args.limit:
+        dataset = dataset.select(range(min(args.limit, len(dataset))))
+
+    output_path = Path(args.output) if args.output else Path(f"swe_bench_pro_{split}.jsonl")
+
+    dataset.to_json(str(output_path))
+    print(f"Exported {len(dataset)} instances to {output_path}")
+    return 0
+
+
 def list_models_command(args):
     """List available models"""
     backend = args.backend if hasattr(args, 'backend') and args.backend else DEFAULT_BACKEND
@@ -373,6 +461,10 @@ Examples:
   # Run with specific model
   python swe_bench.py run --model opus-4.1 --quick
   python swe_bench.py run --model sonnet-3.7 --limit 20
+
+  # SWE-bench Pro workflow
+  python swe_bench.py run --dataset ScaleAI/SWE-bench_Pro --limit 1 --no-eval
+  python swe_bench.py convert-pro predictions/predictions_YYYYMMDD_HHMMSS.jsonl
         """
     )
     
@@ -420,6 +512,24 @@ Examples:
     scores_parser.add_argument('--export', type=str, metavar='FILE.csv', help='Export to CSV')
     scores_parser.add_argument('--last', type=int, metavar='N', help='Show only last N entries')
     
+    # CONVERT-PRO command
+    convert_pro_parser = subparsers.add_parser('convert-pro',
+        help='Convert predictions to ScaleAI SWE-bench Pro evaluation format')
+    convert_pro_parser.add_argument('file', type=str, help='Prediction file (.jsonl or .json)')
+    convert_pro_parser.add_argument('--output', '-o', type=str, help='Output JSON file path')
+    convert_pro_parser.add_argument('--prefix', type=str, help='Model prefix for output filenames (default: claude-code)')
+    convert_pro_parser.add_argument('--include-empty', action='store_true',
+        help='Include predictions with empty patches')
+
+    # EXPORT-DATASET command
+    export_dataset_parser = subparsers.add_parser('export-dataset',
+        help='Export HuggingFace dataset to local JSONL')
+    export_dataset_parser.add_argument('--dataset', default='ScaleAI/SWE-bench_Pro',
+        help='HuggingFace dataset name (default: ScaleAI/SWE-bench_Pro)')
+    export_dataset_parser.add_argument('--split', default='test', help='Dataset split (default: test)')
+    export_dataset_parser.add_argument('--output', '-o', type=str, help='Output JSONL file path')
+    export_dataset_parser.add_argument('--limit', type=int, help='Limit number of instances')
+
     # Shortcut commands
     subparsers.add_parser('quick', help='Quick test (10 instances with eval)')
     subparsers.add_parser('full', help='Full test (300 instances with eval)')
@@ -496,6 +606,10 @@ Examples:
             export = None
             last = None
         return scores_command(CheckArgs())
+    elif args.command == 'convert-pro':
+        return convert_pro_command(args)
+    elif args.command == 'export-dataset':
+        return export_dataset_command(args)
     elif args.command == 'list-models':
         return list_models_command(args)
     else:

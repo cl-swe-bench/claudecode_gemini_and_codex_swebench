@@ -1,6 +1,6 @@
 {
   "mcp_url": "https://api.codelexica.com/mcp",
-  "repos": {
+  "swe_bench_lite": {
     "django/django": "cl_your_token_here",
     "scikit-learn/scikit-learn": "cl_your_token_here",
     "matplotlib/matplotlib": "cl_your_token_here",
@@ -13,5 +13,18 @@
     "sphinx-doc/sphinx": "cl_your_token_here",
     "pylint-dev/pylint": "cl_your_token_here",
     "mwaskom/seaborn": "cl_your_token_here"
+  },
+  "swe_bench_pro": {
+    "NodeBB/NodeBB": "cl_your_token_here",
+    "ansible/ansible": "cl_your_token_here",
+    "element-hq/element-web": "cl_your_token_here",
+    "flipt-io/flipt": "cl_your_token_here",
+    "future-architect/vuls": "cl_your_token_here",
+    "gravitational/teleport": "cl_your_token_here",
+    "internetarchive/openlibrary": "cl_your_token_here",
+    "navidrome/navidrome": "cl_your_token_here",
+    "protonmail/webclients": "cl_your_token_here",
+    "qutebrowser/qutebrowser": "cl_your_token_here",
+    "tutao/tutanota": "cl_your_token_here"
   }
 }
