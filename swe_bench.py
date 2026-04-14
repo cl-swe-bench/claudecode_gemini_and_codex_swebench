@@ -410,22 +410,56 @@ def convert_pro_command(args):
 
 
 def export_dataset_command(args):
-    """Export a HuggingFace dataset to local JSONL for ScaleAI evaluation."""
-    from datasets import load_dataset
+    """Export a HuggingFace dataset to local CSV or JSONL for ScaleAI evaluation.
 
+    CSV is the recommended format because the ScaleAI evaluator uses
+    ``eval()`` on the FAIL_TO_PASS / PASS_TO_PASS columns.  When loaded
+    from JSONL via ``pandas.read_json``, those columns become native
+    Python lists and ``eval()`` crashes.  CSV keeps them as strings.
+    """
+    import pandas as pd
+
+    source = args.source
     dataset_name = args.dataset
     split = args.split or "test"
+    fmt = args.format or "csv"
 
-    print(f"Loading dataset: {dataset_name} (split: {split})")
-    dataset = load_dataset(dataset_name, split=split)
+    if source:
+        # Convert a local JSONL file
+        print(f"Loading local file: {source}")
+        df = pd.read_json(source, lines=True)
+    else:
+        # Load from HuggingFace
+        from datasets import load_dataset
+        print(f"Loading dataset: {dataset_name} (split: {split})")
+        dataset = load_dataset(dataset_name, split=split)
+        if args.limit:
+            dataset = dataset.select(range(min(args.limit, len(dataset))))
+        df = dataset.to_pandas()
 
-    if args.limit:
-        dataset = dataset.select(range(min(args.limit, len(dataset))))
+    if args.limit and not source:
+        pass  # already limited above
+    elif args.limit:
+        df = df.head(args.limit)
 
-    output_path = Path(args.output) if args.output else Path(f"swe_bench_pro_{split}.jsonl")
+    # For CSV output, ensure list columns are serialised as strings
+    # so the evaluator's eval() calls work correctly.
+    if fmt == "csv":
+        for col in ("FAIL_TO_PASS", "PASS_TO_PASS", "fail_to_pass", "pass_to_pass"):
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda v: json.dumps(v) if isinstance(v, list) else v
+                )
 
-    dataset.to_json(str(output_path))
-    print(f"Exported {len(dataset)} instances to {output_path}")
+    default_name = f"swe_bench_pro_{split}.{fmt}"
+    output_path = Path(args.output) if args.output else Path(default_name)
+
+    if fmt == "csv":
+        df.to_csv(output_path, index=False)
+    else:
+        df.to_json(output_path, orient="records", lines=True)
+
+    print(f"Exported {len(df)} instances to {output_path} ({fmt})")
     return 0
 
 
@@ -523,11 +557,15 @@ Examples:
 
     # EXPORT-DATASET command
     export_dataset_parser = subparsers.add_parser('export-dataset',
-        help='Export HuggingFace dataset to local JSONL')
+        help='Export HuggingFace dataset (or local JSONL) to CSV/JSONL for ScaleAI evaluation')
+    export_dataset_parser.add_argument('--source', type=str,
+        help='Local JSONL file to convert (e.g. sweap_eval_full_v2.jsonl). If omitted, downloads from HuggingFace.')
     export_dataset_parser.add_argument('--dataset', default='ScaleAI/SWE-bench_Pro',
         help='HuggingFace dataset name (default: ScaleAI/SWE-bench_Pro)')
     export_dataset_parser.add_argument('--split', default='test', help='Dataset split (default: test)')
-    export_dataset_parser.add_argument('--output', '-o', type=str, help='Output JSONL file path')
+    export_dataset_parser.add_argument('--format', choices=['csv', 'jsonl'], default='csv',
+        help='Output format (default: csv). CSV recommended for ScaleAI evaluator compatibility.')
+    export_dataset_parser.add_argument('--output', '-o', type=str, help='Output file path')
     export_dataset_parser.add_argument('--limit', type=int, help='Limit number of instances')
 
     # Shortcut commands
