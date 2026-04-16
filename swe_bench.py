@@ -442,14 +442,20 @@ def export_dataset_command(args):
     elif args.limit:
         df = df.head(args.limit)
 
-    # For CSV output, ensure list columns are serialised as strings
-    # so the evaluator's eval() calls work correctly.
-    if fmt == "csv":
-        for col in ("FAIL_TO_PASS", "PASS_TO_PASS", "fail_to_pass", "pass_to_pass"):
-            if col in df.columns:
+    # Ensure list columns are serialised as strings so the evaluator's
+    # eval() calls work correctly, and add lowercase aliases since the
+    # ScaleAI evaluator reads "fail_to_pass" / "pass_to_pass" (lowercase)
+    # but the dataset uses "FAIL_TO_PASS" / "PASS_TO_PASS" (uppercase).
+    for col in ("FAIL_TO_PASS", "PASS_TO_PASS", "fail_to_pass", "pass_to_pass"):
+        if col in df.columns:
+            if fmt == "csv":
                 df[col] = df[col].apply(
                     lambda v: json.dumps(v) if isinstance(v, list) else v
                 )
+    # Add lowercase columns if only uppercase exist
+    for upper, lower in (("FAIL_TO_PASS", "fail_to_pass"), ("PASS_TO_PASS", "pass_to_pass")):
+        if upper in df.columns and lower not in df.columns:
+            df[lower] = df[upper]
 
     default_name = f"swe_bench_pro_{split}.{fmt}"
     output_path = Path(args.output) if args.output else Path(default_name)
