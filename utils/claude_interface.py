@@ -9,8 +9,15 @@ load_dotenv()
 class ClaudeCodeInterface:
     """Interface for interacting with Claude Code CLI."""
 
-    def __init__(self):
-        """Ensure the Claude CLI is available on the system."""
+    def __init__(self, timeout_s: int = 900):
+        """Ensure the Claude CLI is available on the system.
+
+        Args:
+            timeout_s: Subprocess timeout for each ``claude -p`` invocation.
+                Worker callers plumb this through from ``run_shard``; the
+                standalone CLI picks up the default.
+        """
+        self.timeout_s = timeout_s
         try:
             result = subprocess.run([
                 "claude", "--version"
@@ -51,7 +58,7 @@ class ClaudeCodeInterface:
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=600,  # 10 minute timeout
+                timeout=self.timeout_s,
             )
 
             # Restore original directory
@@ -107,9 +114,10 @@ class ClaudeCodeInterface:
             return {
                 "success": False,
                 "stdout": "",
-                "stderr": "Command timed out after 10 minutes",
+                "stderr": f"Command timed out after {self.timeout_s} seconds",
                 "returncode": -1,
                 "token_usage": {},
+                "timed_out": True,
             }
         except Exception as e:
             os.chdir(original_cwd)
@@ -126,3 +134,18 @@ class ClaudeCodeInterface:
         # This will be implemented by patch_extractor.py
         # For now, return empty list
         return []
+
+    @staticmethod
+    def _to_token_usage(usage: Dict) -> Dict[str, int]:
+        """Normalize Claude's token_usage dict to the cl-benchmark library schema.
+
+        Returned keys match ``cl_benchmark_core.schemas.library.InstanceTokenUsage``:
+        ``input``, ``output``, ``cache_creation``, ``cache_read``.
+        """
+        usage = usage or {}
+        return {
+            "input": int(usage.get("input_tokens", 0) or 0),
+            "output": int(usage.get("output_tokens", 0) or 0),
+            "cache_creation": int(usage.get("cache_creation_tokens", 0) or 0),
+            "cache_read": int(usage.get("cache_read_tokens", 0) or 0),
+        }

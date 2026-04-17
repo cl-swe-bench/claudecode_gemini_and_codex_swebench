@@ -5,8 +5,9 @@ from typing import Dict, List
 class GeminiCodeInterface:
     """Interface for interacting with the Google Gemini CLI."""
 
-    def __init__(self):
+    def __init__(self, timeout_s: int = 900):
         """Ensure the Gemini CLI is available on the system."""
+        self.timeout_s = timeout_s
         try:
             result = subprocess.run(["gemini", "--version"], capture_output=True, text=True)
             if result.returncode != 0:
@@ -41,7 +42,7 @@ class GeminiCodeInterface:
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=600,  # 10 minute timeout
+                timeout=self.timeout_s,
             )
 
             os.chdir(original_cwd)
@@ -58,8 +59,9 @@ class GeminiCodeInterface:
             return {
                 "success": False,
                 "stdout": "",
-                "stderr": "Command timed out after 10 minutes",
+                "stderr": f"Command timed out after {self.timeout_s} seconds",
                 "returncode": -1,
+                "timed_out": True,
             }
         except Exception as e:
             os.chdir(original_cwd)
@@ -73,3 +75,19 @@ class GeminiCodeInterface:
     def extract_file_changes(self, response: str) -> List[Dict[str, str]]:
         """Extract file changes from Gemini's response (placeholder)."""
         return []
+
+    @staticmethod
+    def _to_token_usage(usage: Dict) -> Dict[str, int]:
+        """Normalize Gemini token usage to the cl-benchmark library schema.
+
+        TODO(P4): Gemini CLI does not currently emit token usage in a format we
+        parse — returns zeros. Verify against the Gemini CLI JSON contract when
+        API-key backends come online.
+        """
+        usage = usage or {}
+        return {
+            "input": int(usage.get("input_tokens", 0) or 0),
+            "output": int(usage.get("output_tokens", 0) or 0),
+            "cache_creation": 0,
+            "cache_read": 0,
+        }

@@ -10,8 +10,9 @@ import sys
 import subprocess
 import tempfile
 import shutil
+import time
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Any, Callable, List, Dict, Optional
 from pathlib import Path
 
 from datasets import load_dataset
@@ -38,15 +39,17 @@ class CodeSWEAgent:
                  backend: str = DEFAULT_BACKEND,
                  mcp_enabled: bool = False,
                  repos_filter: Optional[List[str]] = None,
-                 mcp_repos_only: bool = False):
+                 mcp_repos_only: bool = False,
+                 mcp_config_path: Optional[str] = None,
+                 subprocess_timeout_s: int = 900):
         self.backend = (backend or DEFAULT_BACKEND).lower()
         if self.backend == "codex":
-            self.interface = CodexCodeInterface()
+            self.interface = CodexCodeInterface(timeout_s=subprocess_timeout_s)
         elif self.backend == "gemini":
-            self.interface = GeminiCodeInterface()
+            self.interface = GeminiCodeInterface(timeout_s=subprocess_timeout_s)
         else:
             self.backend = "claude"
-            self.interface = ClaudeCodeInterface()
+            self.interface = ClaudeCodeInterface(timeout_s=subprocess_timeout_s)
 
         self.prompt_formatter = PromptFormatter(prompt_template)
         self.patch_extractor = PatchExtractor()
@@ -62,7 +65,8 @@ class CodeSWEAgent:
         self.mcp_enabled = mcp_enabled
         self.mcp_manager = None
         if mcp_enabled or mcp_repos_only:
-            self.mcp_manager = McpConfigManager()
+            self.mcp_manager = McpConfigManager(registry_path=mcp_config_path) if mcp_config_path \
+                else McpConfigManager()
             if mcp_enabled:
                 print("MCP mode enabled — Code Lexica context will be injected per repo")
 
@@ -163,6 +167,8 @@ class CodeSWEAgent:
                 "prediction": "",
                 "error": "Failed to set up repository",
                 "token_usage": {},
+                "raw_stdout": "",
+                "raw_stderr": "",
             }
 
         try:
@@ -193,6 +199,9 @@ class CodeSWEAgent:
                     "prediction": "",
                     "error": f"Execution failed: {result['stderr']}",
                     "token_usage": token_usage,
+                    "raw_stdout": result.get("stdout", "") or "",
+                    "raw_stderr": result.get("stderr", "") or "",
+                    "timed_out": bool(result.get("timed_out")),
                 }
 
             # Extract patch from git diff (works regardless of output format)
@@ -207,6 +216,8 @@ class CodeSWEAgent:
                 patch, instance_id, self.model_alias or f"{self.backend}-code"
             )
             prediction["token_usage"] = token_usage
+            prediction["raw_stdout"] = result.get("stdout", "") or ""
+            prediction["raw_stderr"] = result.get("stderr", "") or ""
 
             self._save_result(instance_id, result, patch)
 
@@ -222,6 +233,8 @@ class CodeSWEAgent:
                 "prediction": "",
                 "error": str(e),
                 "token_usage": {},
+                "raw_stdout": "",
+                "raw_stderr": "",
             }
         finally:
             try:
@@ -378,6 +391,163 @@ class CodeSWEAgent:
 
         with jsonlines.open(self.pred_file, mode='a') as writer:
             writer.write(prediction)
+
+
+def run_shard(
+    instance_ids: List[str],
+    dataset_name: str,
+    *,
+    dataset_revision: Optional[str] = None,
+    mcp_enabled: bool = False,
+    mcp_config_path: Optional[str] = None,
+    model: Optional[str] = None,
+    backend: str = "claude",
+    prompt_template: Optional[str] = None,
+    on_instance_start: Optional[Callable[[str], None]] = None,
+    on_instance_complete: Optional[Callable[[Any], None]] = None,
+    on_instance_error: Optional[Callable[[str, Exception, str], None]] = None,
+    subprocess_timeout_s: int = 900,
+) -> List[Any]:
+    """Shardable library entry point used by the cl-benchmark worker.
+
+    Unlike ``CodeSWEAgent.run_on_dataset``, this does NOT write JSONL
+    predictions, per-instance result files, or ``benchmark_scores.log`` —
+    the caller owns persistence. Callbacks fire at each instance boundary so
+    the worker can write to Postgres + MinIO without the harness knowing
+    about either.
+
+    Returns a list of ``cl_benchmark_core.schemas.library.InstanceRunResult``
+    Pydantic models (import is lazy so standalone CLI use of this harness
+    does not require ``cl-benchmark-core`` to be installed).
+    """
+    # Lazy import: keeps the harness usable standalone when cl-benchmark-core
+    # is not installed (direct CLI / test_sets workflow).
+    from cl_benchmark_core.schemas.library import (
+        ErrorKind,
+        InstanceRunResult,
+        InstanceTokenUsage,
+        LibraryInstanceStatus,
+    )
+
+    agent = CodeSWEAgent(
+        prompt_template=prompt_template,
+        model=model,
+        backend=backend,
+        mcp_enabled=mcp_enabled,
+        mcp_config_path=mcp_config_path,
+        subprocess_timeout_s=subprocess_timeout_s,
+    )
+
+    dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")
+    id_set = set(instance_ids)
+    dataset = dataset.filter(lambda inst: inst["instance_id"] in id_set)
+    by_id = {inst["instance_id"]: inst for inst in dataset}
+
+    results: List[InstanceRunResult] = []
+
+    for instance_id in instance_ids:
+        instance = by_id.get(instance_id)
+        if instance is None:
+            err = LookupError(f"instance_id '{instance_id}' not in {dataset_name}@{dataset_revision}")
+            if on_instance_error is not None:
+                on_instance_error(instance_id, err, "")
+            result = InstanceRunResult(
+                instance_id=instance_id,
+                repo=None,
+                status=LibraryInstanceStatus.ERROR,
+                patch=None,
+                error_message=str(err),
+                error_kind=ErrorKind.SETUP_ERROR,
+            )
+            results.append(result)
+            if on_instance_complete is not None:
+                on_instance_complete(result)
+            continue
+
+        if on_instance_start is not None:
+            on_instance_start(instance_id)
+
+        start_monotonic = time.monotonic()
+        try:
+            prediction = agent.process_instance(instance)
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            if on_instance_error is not None:
+                on_instance_error(instance_id, exc, tb)
+            result = InstanceRunResult(
+                instance_id=instance_id,
+                repo=instance.get("repo"),
+                status=LibraryInstanceStatus.ERROR,
+                patch=None,
+                error_message=str(exc),
+                error_kind=ErrorKind.UNKNOWN,
+                duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                raw_stderr=tb,
+            )
+            results.append(result)
+            if on_instance_complete is not None:
+                on_instance_complete(result)
+            continue
+
+        token_usage_raw = prediction.get("token_usage") or {}
+        normalized = agent.interface._to_token_usage(token_usage_raw)
+        token_usage = InstanceTokenUsage(**normalized)
+
+        # Prefer the harness-reported duration (Claude Code exposes it in its
+        # JSON response); fall back to wall-clock for backends that don't.
+        duration_ms = token_usage_raw.get("duration_ms")
+        if duration_ms is None:
+            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+        num_turns = token_usage_raw.get("num_turns")
+
+        raw_stdout = prediction.get("raw_stdout", "") or ""
+        raw_stderr = prediction.get("raw_stderr", "") or ""
+        patch = prediction.get("prediction") or ""
+        error_message = prediction.get("error")
+
+        if error_message:
+            status = LibraryInstanceStatus.ERROR
+            if prediction.get("timed_out"):
+                error_kind = ErrorKind.TIMEOUT
+            elif "set up repository" in error_message.lower():
+                error_kind = ErrorKind.SETUP_ERROR
+            else:
+                error_kind = ErrorKind.SUBPROCESS_ERROR
+            result_patch = None
+        elif patch:
+            status = LibraryInstanceStatus.GENERATED
+            error_kind = None
+            result_patch = patch
+        else:
+            status = LibraryInstanceStatus.ERROR
+            error_message = "no patch produced"
+            error_kind = ErrorKind.PARSING_ERROR
+            result_patch = None
+
+        result = InstanceRunResult(
+            instance_id=instance_id,
+            repo=instance.get("repo"),
+            status=status,
+            patch=result_patch,
+            token_usage=token_usage,
+            duration_ms=duration_ms,
+            num_turns=num_turns,
+            raw_stdout=raw_stdout,
+            raw_stderr=raw_stderr,
+            error_message=error_message,
+            error_kind=error_kind,
+        )
+        results.append(result)
+
+        # ``on_instance_error`` is reserved for unhandled harness exceptions
+        # — an error InstanceRunResult still goes through the normal
+        # completion callback so the worker writes the log + emits a single
+        # terminal event per instance.
+        if on_instance_complete is not None:
+            on_instance_complete(result)
+
+    return results
 
 
 def main():
