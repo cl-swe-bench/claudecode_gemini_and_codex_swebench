@@ -56,6 +56,9 @@ output.txt
 **/.tmp
 tmp/
 
+# Code Lexica MCP tokens
+configs/code_lexica_repos.json
+
 # Files that commonly contain secrets
 **/*.key
 **/*.pem
@@ -93,3 +96,4 @@ pip-delete-this-directory.txt
 pip-log.txt
 pip-wheel-metadata/
 venv
+.claude/settings.local.json

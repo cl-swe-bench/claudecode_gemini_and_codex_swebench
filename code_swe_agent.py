@@ -10,8 +10,9 @@ import sys
 import subprocess
 import tempfile
 import shutil
+import time
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Any, Callable, List, Dict, Optional
 from pathlib import Path
 
 from datasets import load_dataset
@@ -24,6 +25,7 @@ from utils.gemini_interface import GeminiCodeInterface
 from utils.prompt_formatter import PromptFormatter
 from utils.patch_extractor import PatchExtractor
 from utils.model_registry import get_model_name
+from utils.mcp_config import McpConfigManager
 
 
 DEFAULT_BACKEND = os.environ.get("CODE_SWE_BACKEND", "claude")
@@ -34,15 +36,38 @@ class CodeSWEAgent:
 
     def __init__(self, prompt_template: Optional[str] = None,
                  model: Optional[str] = None,
-                 backend: str = DEFAULT_BACKEND):
+                 backend: str = DEFAULT_BACKEND,
+                 mcp_enabled: bool = False,
+                 repos_filter: Optional[List[str]] = None,
+                 mcp_repos_only: bool = False,
+                 mcp_config_path: Optional[str] = None,
+                 subprocess_timeout_s: int = 900,
+                 env_overrides: Optional[Dict[str, str]] = None,
+                 on_rate_limit_retry: Optional[Callable[[Any], None]] = None):
+        # env_overrides + on_rate_limit_retry are Phase 4 additions. The
+        # worker plumbs per-shard env + a structlog-emitting callback; the
+        # standalone CLI leaves both at None and the behaviour is
+        # identical to P3.
         self.backend = (backend or DEFAULT_BACKEND).lower()
         if self.backend == "codex":
-            self.interface = CodexCodeInterface()
+            self.interface = CodexCodeInterface(
+                timeout_s=subprocess_timeout_s,
+                env_overrides=env_overrides,
+                on_rate_limit_retry=on_rate_limit_retry,
+            )
         elif self.backend == "gemini":
-            self.interface = GeminiCodeInterface()
+            self.interface = GeminiCodeInterface(
+                timeout_s=subprocess_timeout_s,
+                env_overrides=env_overrides,
+                on_rate_limit_retry=on_rate_limit_retry,
+            )
         else:
             self.backend = "claude"
-            self.interface = ClaudeCodeInterface()
+            self.interface = ClaudeCodeInterface(
+                timeout_s=subprocess_timeout_s,
+                env_overrides=env_overrides,
+                on_rate_limit_retry=on_rate_limit_retry,
+            )
 
         self.prompt_formatter = PromptFormatter(prompt_template)
         self.patch_extractor = PatchExtractor()
@@ -53,6 +78,34 @@ class CodeSWEAgent:
         # Resolve model name from alias
         self.model = get_model_name(model, self.backend) if model else None
         self.model_alias = model  # Keep original alias for logging
+
+        # MCP configuration
+        self.mcp_enabled = mcp_enabled
+        self.mcp_manager = None
+        if mcp_enabled or mcp_repos_only:
+            self.mcp_manager = McpConfigManager(registry_path=mcp_config_path) if mcp_config_path \
+                else McpConfigManager()
+            if mcp_enabled:
+                print("MCP mode enabled — Code Lexica context will be injected per repo")
+
+        # Repo filtering
+        self.repos_filter = None
+        if mcp_repos_only and self.mcp_manager:
+            # Derive filter from repos that have valid (non-placeholder) tokens
+            configured_repos = self.mcp_manager.get_configured_repos()
+            if repos_filter:
+                # Intersect: only repos that are both requested AND have tokens
+                self.repos_filter = configured_repos & set(repos_filter)
+            else:
+                self.repos_filter = configured_repos
+            print(f"MCP repos filter: {len(self.repos_filter)} repos with tokens configured")
+            for repo in sorted(self.repos_filter):
+                print(f"  - {repo}")
+        elif repos_filter:
+            self.repos_filter = set(repos_filter)
+            print(f"Repo filter: {len(self.repos_filter)} repos selected")
+            for repo in sorted(self.repos_filter):
+                print(f"  - {repo}")
 
         # Create directories if they don't exist
         self.results_dir.mkdir(exist_ok=True)
@@ -131,9 +184,18 @@ class CodeSWEAgent:
                 "model": f"{self.backend}-code",
                 "prediction": "",
                 "error": "Failed to set up repository",
+                "token_usage": {},
+                "raw_stdout": "",
+                "raw_stderr": "",
             }
 
         try:
+            # Inject or remove MCP config before running the agent
+            if self.mcp_enabled and self.mcp_manager:
+                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
+            else:
+                McpConfigManager.remove_mcp_json(repo_path)
+
             prompt = self.prompt_formatter.format_for_cli(instance)
 
             os.chdir(repo_path)
@@ -144,6 +206,8 @@ class CodeSWEAgent:
             print(f"Running {self.backend.title()} Code{model_info}...")
             result = self.interface.execute_code_cli(prompt, repo_path, self.model)
 
+            token_usage = result.get("token_usage", {})
+
             if not result["success"]:
                 print(f"{self.backend.title()} Code execution failed: {result['stderr']}")
                 os.chdir(original_dir)
@@ -152,8 +216,13 @@ class CodeSWEAgent:
                     "model": self.model_alias or f"{self.backend}-code",
                     "prediction": "",
                     "error": f"Execution failed: {result['stderr']}",
+                    "token_usage": token_usage,
+                    "raw_stdout": result.get("stdout", "") or "",
+                    "raw_stderr": result.get("stderr", "") or "",
+                    "timed_out": bool(result.get("timed_out")),
                 }
 
+            # Extract patch from git diff (works regardless of output format)
             patch = self.patch_extractor.extract_from_cli_output(result["stdout"], repo_path)
 
             is_valid, error = self.patch_extractor.validate_patch(patch)
@@ -164,6 +233,9 @@ class CodeSWEAgent:
             prediction = self.patch_extractor.format_for_swebench(
                 patch, instance_id, self.model_alias or f"{self.backend}-code"
             )
+            prediction["token_usage"] = token_usage
+            prediction["raw_stdout"] = result.get("stdout", "") or ""
+            prediction["raw_stderr"] = result.get("stderr", "") or ""
 
             self._save_result(instance_id, result, patch)
 
@@ -178,6 +250,9 @@ class CodeSWEAgent:
                 "model": self.model_alias or f"{self.backend}-code",
                 "prediction": "",
                 "error": str(e),
+                "token_usage": {},
+                "raw_stdout": "",
+                "raw_stderr": "",
             }
         finally:
             try:
@@ -191,12 +266,19 @@ class CodeSWEAgent:
         """Save detailed results for debugging."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         result_file = self.results_dir / f"{instance_id}_{timestamp}.json"
-        
+
         with open(result_file, 'w') as f:
             json.dump({
                 "instance_id": instance_id,
                 "timestamp": timestamp,
-                "claude_output": result,
+                "token_usage": result.get("token_usage", {}),
+                "claude_output": {
+                    "success": result.get("success"),
+                    "returncode": result.get("returncode"),
+                    "stderr": result.get("stderr", ""),
+                    # Truncate stdout to avoid huge files (JSON output can be large)
+                    "stdout_length": len(result.get("stdout", "")),
+                },
                 "extracted_patch": patch
             }, f, indent=2)
             
@@ -205,10 +287,22 @@ class CodeSWEAgent:
         """Run on a full dataset."""
         print(f"Loading dataset: {dataset_name}")
         dataset = load_dataset(dataset_name, split=split)
-        
+
+        # Filter by repos if specified
+        if self.repos_filter:
+            original_count = len(dataset)
+            dataset = dataset.filter(
+                lambda instance: instance["repo"] in self.repos_filter
+            )
+            print(f"Repo filter: {len(dataset)}/{original_count} instances match selected repos")
+
         if limit:
             dataset = dataset.select(range(min(limit, len(dataset))))
-            
+
+        if len(dataset) == 0:
+            print("No instances to process after filtering.")
+            return []
+
         self.pred_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.pred_file = self.predictions_dir / f"predictions_{self.pred_timestamp}.jsonl"
         if self.pred_file.exists():
@@ -218,13 +312,73 @@ class CodeSWEAgent:
             json_file.unlink()
 
         predictions: List[Dict] = []
+        total = len(dataset)
+        patches_generated = 0
+        total_tokens = 0
+        total_cost = 0.0
 
-        for instance in tqdm(dataset, desc="Processing instances"):
+        for idx, instance in enumerate(dataset, 1):
+            instance_id = instance["instance_id"]
+            repo = instance["repo"]
+            elapsed = (datetime.now() - datetime.strptime(self.pred_timestamp, "%Y%m%d_%H%M%S")).total_seconds()
+            avg_time = elapsed / (idx - 1) if idx > 1 else 0
+            remaining = avg_time * (total - idx + 1)
+
+            print(f"\n{'='*60}")
+            print(f"[{idx}/{total}] {instance_id}")
+            print(f"  Repo: {repo}")
+            if idx > 1:
+                print(f"  Avg time/task: {avg_time:.0f}s | Est. remaining: {remaining/60:.1f}m")
+                print(f"  Patches so far: {patches_generated}/{idx-1} ({patches_generated/(idx-1)*100:.0f}%)")
+                stats_parts = []
+                if total_tokens > 0:
+                    stats_parts.append(f"Tokens: {total_tokens:,}")
+                if total_cost > 0:
+                    stats_parts.append(f"Cost: ${total_cost:.2f}")
+                if stats_parts:
+                    print(f"  Running totals: {' | '.join(stats_parts)}")
+            print(f"{'='*60}")
+
             prediction = self.process_instance(instance)
-            predictions.append(prediction)
 
-            # Save prediction incrementally
+            has_patch = bool(prediction.get("prediction", "").strip())
+            if has_patch:
+                patches_generated += 1
+
+            # Accumulate token usage if available
+            task_usage = prediction.get("token_usage", {})
+            task_tokens = task_usage.get("total_tokens", 0)
+            task_cost = task_usage.get("cost_usd", 0) or 0
+            task_turns = task_usage.get("num_turns")
+            task_duration = task_usage.get("duration_ms")
+            total_tokens += task_tokens
+            total_cost += task_cost
+
+            # Per-task result summary
+            status = "PATCH" if has_patch else "NO PATCH"
+            details = [status]
+            if task_tokens:
+                details.append(f"{task_tokens:,} tokens")
+            if task_cost:
+                details.append(f"${task_cost:.3f}")
+            if task_turns:
+                details.append(f"{task_turns} turns")
+            if task_duration:
+                details.append(f"{task_duration/1000:.1f}s")
+            print(f"  Result: {' | '.join(details)}")
+
+            predictions.append(prediction)
             self._save_predictions(prediction)
+
+        print(f"\n{'='*60}")
+        print(f"GENERATION COMPLETE")
+        print(f"  Tasks: {total}")
+        print(f"  Patches: {patches_generated}/{total} ({patches_generated/total*100:.0f}%)")
+        if total_tokens > 0:
+            print(f"  Total tokens: {total_tokens:,} (avg {total_tokens//total:,}/task)")
+        if total_cost > 0:
+            print(f"  Total cost: ${total_cost:.2f} (avg ${total_cost/total:.3f}/task)")
+        print(f"{'='*60}")
 
         with open(json_file, 'w') as f:
             json.dump(predictions, f, indent=2)
@@ -257,6 +411,195 @@ class CodeSWEAgent:
             writer.write(prediction)
 
 
+def run_shard(
+    instance_ids: List[str],
+    dataset_name: str,
+    *,
+    dataset_revision: Optional[str] = None,
+    mcp_enabled: bool = False,
+    mcp_config_path: Optional[str] = None,
+    model: Optional[str] = None,
+    backend: str = "claude",
+    prompt_template: Optional[str] = None,
+    on_instance_start: Optional[Callable[[str], None]] = None,
+    on_instance_complete: Optional[Callable[[Any], None]] = None,
+    on_instance_error: Optional[Callable[[str, Exception, str], None]] = None,
+    subprocess_timeout_s: int = 900,
+    api_key: Optional[str] = None,
+    env_overrides: Optional[Dict[str, str]] = None,
+    rate_limit_callback: Optional[Callable[[Any], None]] = None,
+) -> List[Any]:
+    """Shardable library entry point used by the cl-benchmark worker.
+
+    Unlike ``CodeSWEAgent.run_on_dataset``, this does NOT write JSONL
+    predictions, per-instance result files, or ``benchmark_scores.log`` —
+    the caller owns persistence. Callbacks fire at each instance boundary so
+    the worker can write to Postgres + MinIO without the harness knowing
+    about either.
+
+    Phase 4 additions:
+      - ``api_key``: informational — the caller's intent to run API-key
+        mode. Not read directly (see ``env_overrides``). Kept as a
+        distinct arg so log output can elide the secret while logging
+        the intent.
+      - ``env_overrides``: merged into each subprocess's ``env=``. The
+        worker injects ``ANTHROPIC_API_KEY`` (or the per-harness
+        equivalent) here and relocates ``HOME``/``XDG_CONFIG_HOME`` to
+        a per-shard sandbox so codex/gemini auth caches don't race and
+        so api_key-claude doesn't pick up a host Max OAuth from
+        ``~/.claude/auth.json``.
+      - ``rate_limit_callback``: invoked per retry with a ``RateLimitEvent``
+        so the worker can emit ``instance.rate_limit_retry`` events.
+
+    Returns a list of ``cl_benchmark_core.schemas.library.InstanceRunResult``
+    Pydantic models (import is lazy so standalone CLI use of this harness
+    does not require ``cl-benchmark-core`` to be installed).
+    """
+    # ``api_key`` is currently informational — the actual injection is via
+    # ``env_overrides``. Referencing it here keeps linters quiet and
+    # documents the parameter's role. If we ever want to log the call
+    # without the secret, this is where redaction would land.
+    _ = api_key
+    # Lazy import: keeps the harness usable standalone when cl-benchmark-core
+    # is not installed (direct CLI / test_sets workflow).
+    from cl_benchmark_core.schemas.library import (
+        ErrorKind,
+        InstanceRunResult,
+        InstanceTokenUsage,
+        LibraryInstanceStatus,
+    )
+
+    agent = CodeSWEAgent(
+        prompt_template=prompt_template,
+        model=model,
+        backend=backend,
+        mcp_enabled=mcp_enabled,
+        mcp_config_path=mcp_config_path,
+        subprocess_timeout_s=subprocess_timeout_s,
+        env_overrides=env_overrides,
+        on_rate_limit_retry=rate_limit_callback,
+    )
+
+    dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")
+    id_set = set(instance_ids)
+    dataset = dataset.filter(lambda inst: inst["instance_id"] in id_set)
+    by_id = {inst["instance_id"]: inst for inst in dataset}
+
+    results: List[InstanceRunResult] = []
+
+    for instance_id in instance_ids:
+        instance = by_id.get(instance_id)
+        if instance is None:
+            err = LookupError(f"instance_id '{instance_id}' not in {dataset_name}@{dataset_revision}")
+            if on_instance_error is not None:
+                on_instance_error(instance_id, err, "")
+            result = InstanceRunResult(
+                instance_id=instance_id,
+                repo=None,
+                status=LibraryInstanceStatus.ERROR,
+                patch=None,
+                error_message=str(err),
+                error_kind=ErrorKind.SETUP_ERROR,
+            )
+            results.append(result)
+            if on_instance_complete is not None:
+                on_instance_complete(result)
+            continue
+
+        if on_instance_start is not None:
+            on_instance_start(instance_id)
+
+        start_monotonic = time.monotonic()
+        try:
+            prediction = agent.process_instance(instance)
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            # Map the harness's rate-limit-exhausted exception to a
+            # first-class ErrorKind so the worker emits a distinctly
+            # filterable event and the UI can surface "hit limits 5x".
+            from utils.retry import RateLimitExhausted  # local import — no cycle
+            if isinstance(exc, RateLimitExhausted):
+                mapped_error_kind = ErrorKind.RATE_LIMIT_EXHAUSTED
+            else:
+                mapped_error_kind = ErrorKind.UNKNOWN
+            if on_instance_error is not None:
+                on_instance_error(instance_id, exc, tb)
+            result = InstanceRunResult(
+                instance_id=instance_id,
+                repo=instance.get("repo"),
+                status=LibraryInstanceStatus.ERROR,
+                patch=None,
+                error_message=str(exc),
+                error_kind=mapped_error_kind,
+                duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                raw_stderr=tb,
+            )
+            results.append(result)
+            if on_instance_complete is not None:
+                on_instance_complete(result)
+            continue
+
+        token_usage_raw = prediction.get("token_usage") or {}
+        normalized = agent.interface._to_token_usage(token_usage_raw)
+        token_usage = InstanceTokenUsage(**normalized)
+
+        # Prefer the harness-reported duration (Claude Code exposes it in its
+        # JSON response); fall back to wall-clock for backends that don't.
+        duration_ms = token_usage_raw.get("duration_ms")
+        if duration_ms is None:
+            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+        num_turns = token_usage_raw.get("num_turns")
+
+        raw_stdout = prediction.get("raw_stdout", "") or ""
+        raw_stderr = prediction.get("raw_stderr", "") or ""
+        patch = prediction.get("prediction") or ""
+        error_message = prediction.get("error")
+
+        if error_message:
+            status = LibraryInstanceStatus.ERROR
+            if prediction.get("timed_out"):
+                error_kind = ErrorKind.TIMEOUT
+            elif "set up repository" in error_message.lower():
+                error_kind = ErrorKind.SETUP_ERROR
+            else:
+                error_kind = ErrorKind.SUBPROCESS_ERROR
+            result_patch = None
+        elif patch:
+            status = LibraryInstanceStatus.GENERATED
+            error_kind = None
+            result_patch = patch
+        else:
+            status = LibraryInstanceStatus.ERROR
+            error_message = "no patch produced"
+            error_kind = ErrorKind.PARSING_ERROR
+            result_patch = None
+
+        result = InstanceRunResult(
+            instance_id=instance_id,
+            repo=instance.get("repo"),
+            status=status,
+            patch=result_patch,
+            token_usage=token_usage,
+            duration_ms=duration_ms,
+            num_turns=num_turns,
+            raw_stdout=raw_stdout,
+            raw_stderr=raw_stderr,
+            error_message=error_message,
+            error_kind=error_kind,
+        )
+        results.append(result)
+
+        # ``on_instance_error`` is reserved for unhandled harness exceptions
+        # — an error InstanceRunResult still goes through the normal
+        # completion callback so the worker writes the log + emits a single
+        # terminal event per instance.
+        if on_instance_complete is not None:
+            on_instance_complete(result)
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run code models on SWE-bench")
     parser.add_argument("--dataset_name", type=str,
@@ -272,9 +615,15 @@ def main():
                        help="Model to use (e.g., opus-4.1, codex-4.2, or any name)")
     parser.add_argument("--backend", type=str, choices=["claude", "codex", "gemini"],
                        help="Code model backend to use")
-    
+    parser.add_argument("--mcp", action="store_true",
+                       help="Enable Code Lexica MCP server for codebase context")
+    parser.add_argument("--repos", type=str,
+                       help="Comma-separated list of repos to run (e.g., django/django,sympy/sympy)")
+    parser.add_argument("--mcp-repos-only", action="store_true",
+                       help="Only run on repos that have MCP tokens configured in code_lexica_repos.json")
+
     args = parser.parse_args()
-    
+
     backend = args.backend or DEFAULT_BACKEND
 
     # Check if selected CLI is available
@@ -294,7 +643,17 @@ def main():
         print(f"Error: {cli_cmd} CLI not found. Please ensure '{cli_cmd}' is installed and in PATH")
         sys.exit(1)
 
-    agent = CodeSWEAgent(args.prompt_template, args.model, backend)
+    # Parse repos filter
+    repos_filter = None
+    if args.repos:
+        repos_filter = [r.strip() for r in args.repos.split(",") if r.strip()]
+
+    agent = CodeSWEAgent(
+        args.prompt_template, args.model, backend,
+        mcp_enabled=args.mcp,
+        repos_filter=repos_filter,
+        mcp_repos_only=args.mcp_repos_only,
+    )
     
     # Run on specific instance or dataset
     if args.instance_id:

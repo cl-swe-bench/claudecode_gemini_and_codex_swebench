@@ -29,6 +29,8 @@ def check_swebench_installed():
         print("but evaluation requires it to test if patches actually work.")
         return False
 
+import json
+
 from run_benchmark_with_eval import EnhancedBenchmarkRunner
 from evaluate_predictions import PredictionEvaluator
 from show_scores import ScoreViewer
@@ -37,9 +39,18 @@ from code_swe_agent import DEFAULT_BACKEND
 
 def run_command(args):
     """Handle 'run' subcommand - run new benchmarks"""
+    # Parse repos filter
+    repos_filter = None
+    repos_arg = getattr(args, 'repos', None)
+    if repos_arg:
+        repos_filter = [r.strip() for r in repos_arg.split(",") if r.strip()]
+
     runner = EnhancedBenchmarkRunner(
         model=args.model if hasattr(args, 'model') else None,
         backend=args.backend if hasattr(args, 'backend') and args.backend else DEFAULT_BACKEND,
+        mcp_enabled=getattr(args, 'mcp', False),
+        repos_filter=repos_filter,
+        mcp_repos_only=getattr(args, 'mcp_repos_only', False),
     )
     
     # Set default limit if not specified
@@ -66,6 +77,12 @@ def run_command(args):
         model_name = get_model_name(args.model, runner.backend) if args.model else None
         print(f"Model: {args.model} -> {model_name}")
     print(f"Backend: {runner.backend}")
+    mcp_status = getattr(args, 'mcp', False)
+    print(f"MCP: {'ENABLED (Code Lexica)' if mcp_status else 'DISABLED'}")
+    if repos_filter:
+        print(f"Repos filter: {', '.join(repos_filter)}")
+    if getattr(args, 'mcp_repos_only', False):
+        print(f"MCP repos only: ENABLED")
     print(f"Evaluation: {'DISABLED' if args.no_eval else 'ENABLED'}")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -326,6 +343,132 @@ def check_command(args):
     args.last = None
     return scores_command(args)
 
+def convert_pro_command(args):
+    """Convert predictions to ScaleAI SWE-bench Pro evaluation format."""
+    import jsonlines
+
+    input_path = Path(args.file)
+    if not input_path.exists():
+        # Try looking in predictions/ directory
+        input_path = Path("predictions") / args.file
+    if not input_path.exists():
+        print(f"File not found: {args.file}")
+        return 1
+
+    prefix = args.prefix or "claude-code"
+    predictions = []
+
+    # Support both JSONL and JSON input
+    if input_path.suffix == ".jsonl":
+        with jsonlines.open(input_path) as reader:
+            for obj in reader:
+                predictions.append(obj)
+    else:
+        with open(input_path) as f:
+            data = json.load(f)
+            predictions = data if isinstance(data, list) else [data]
+
+    # Convert to ScaleAI format: JSON array with {instance_id, patch, prefix}
+    converted = []
+    skipped = 0
+    for pred in predictions:
+        patch = pred.get("prediction", "")
+        if not patch.strip() and not args.include_empty:
+            skipped += 1
+            continue
+        converted.append({
+            "instance_id": pred["instance_id"],
+            "patch": patch,
+            "prefix": prefix,
+        })
+
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = input_path.with_name(
+            input_path.stem.replace("predictions_", "patches_pro_") + ".json"
+        )
+
+    with open(output_path, "w") as f:
+        json.dump(converted, f, indent=2)
+
+    print(f"Converted {len(converted)} predictions to ScaleAI Pro format")
+    if skipped:
+        print(f"Skipped {skipped} empty patches (use --include-empty to include them)")
+    print(f"Output: {output_path}")
+    print(f"\nTo evaluate with ScaleAI harness:")
+    print(f"  cd /path/to/SWE-bench_Pro-os")
+    print(f"  python swe_bench_pro_eval.py \\")
+    print(f"    --raw_sample_path helper_code/sweap_eval_full_v2.jsonl \\")
+    print(f"    --patch_path {output_path.resolve()} \\")
+    print(f"    --output_dir eval_output \\")
+    print(f"    --scripts_dir run_scripts \\")
+    print(f"    --dockerhub_username <your_username> \\")
+    print(f"    --use_local_docker")
+    return 0
+
+
+def export_dataset_command(args):
+    """Export a HuggingFace dataset to local CSV or JSONL for ScaleAI evaluation.
+
+    CSV is the recommended format because the ScaleAI evaluator uses
+    ``eval()`` on the FAIL_TO_PASS / PASS_TO_PASS columns.  When loaded
+    from JSONL via ``pandas.read_json``, those columns become native
+    Python lists and ``eval()`` crashes.  CSV keeps them as strings.
+    """
+    import pandas as pd
+
+    source = args.source
+    dataset_name = args.dataset
+    split = args.split or "test"
+    fmt = args.format or "csv"
+
+    if source:
+        # Convert a local JSONL file
+        print(f"Loading local file: {source}")
+        df = pd.read_json(source, lines=True)
+    else:
+        # Load from HuggingFace
+        from datasets import load_dataset
+        print(f"Loading dataset: {dataset_name} (split: {split})")
+        dataset = load_dataset(dataset_name, split=split)
+        if args.limit:
+            dataset = dataset.select(range(min(args.limit, len(dataset))))
+        df = dataset.to_pandas()
+
+    if args.limit and not source:
+        pass  # already limited above
+    elif args.limit:
+        df = df.head(args.limit)
+
+    # Ensure list columns are serialised as strings so the evaluator's
+    # eval() calls work correctly, and add lowercase aliases since the
+    # ScaleAI evaluator reads "fail_to_pass" / "pass_to_pass" (lowercase)
+    # but the dataset uses "FAIL_TO_PASS" / "PASS_TO_PASS" (uppercase).
+    for col in ("FAIL_TO_PASS", "PASS_TO_PASS", "fail_to_pass", "pass_to_pass"):
+        if col in df.columns:
+            if fmt == "csv":
+                df[col] = df[col].apply(
+                    lambda v: json.dumps(v) if isinstance(v, list) else v
+                )
+    # Add lowercase columns if only uppercase exist
+    for upper, lower in (("FAIL_TO_PASS", "fail_to_pass"), ("PASS_TO_PASS", "pass_to_pass")):
+        if upper in df.columns and lower not in df.columns:
+            df[lower] = df[upper]
+
+    default_name = f"swe_bench_pro_{split}.{fmt}"
+    output_path = Path(args.output) if args.output else Path(default_name)
+
+    if fmt == "csv":
+        df.to_csv(output_path, index=False)
+    else:
+        df.to_json(output_path, orient="records", lines=True)
+
+    print(f"Exported {len(df)} instances to {output_path} ({fmt})")
+    return 0
+
+
 def list_models_command(args):
     """List available models"""
     backend = args.backend if hasattr(args, 'backend') and args.backend else DEFAULT_BACKEND
@@ -358,6 +501,10 @@ Examples:
   # Run with specific model
   python swe_bench.py run --model opus-4.1 --quick
   python swe_bench.py run --model sonnet-3.7 --limit 20
+
+  # SWE-bench Pro workflow
+  python swe_bench.py run --dataset ScaleAI/SWE-bench_Pro --limit 1 --no-eval
+  python swe_bench.py convert-pro predictions/predictions_YYYYMMDD_HHMMSS.jsonl
         """
     )
     
@@ -376,6 +523,9 @@ Examples:
     run_parser.add_argument('--notes', default='', help='Optional notes about this run')
     run_parser.add_argument('--model', type=str, help='Model to use (e.g., opus-4.1, codex-4.2)')
     run_parser.add_argument('--backend', type=str, choices=['claude', 'codex', 'gemini'], help='Code model backend')
+    run_parser.add_argument('--mcp', action='store_true', help='Enable Code Lexica MCP server for codebase context')
+    run_parser.add_argument('--repos', type=str, help='Comma-separated list of repos to run (e.g., django/django,sympy/sympy)')
+    run_parser.add_argument('--mcp-repos-only', action='store_true', help='Only run on repos with MCP tokens configured')
     
     # EVAL command
     eval_parser = subparsers.add_parser('eval', help='Evaluate past predictions')
@@ -402,6 +552,28 @@ Examples:
     scores_parser.add_argument('--export', type=str, metavar='FILE.csv', help='Export to CSV')
     scores_parser.add_argument('--last', type=int, metavar='N', help='Show only last N entries')
     
+    # CONVERT-PRO command
+    convert_pro_parser = subparsers.add_parser('convert-pro',
+        help='Convert predictions to ScaleAI SWE-bench Pro evaluation format')
+    convert_pro_parser.add_argument('file', type=str, help='Prediction file (.jsonl or .json)')
+    convert_pro_parser.add_argument('--output', '-o', type=str, help='Output JSON file path')
+    convert_pro_parser.add_argument('--prefix', type=str, help='Model prefix for output filenames (default: claude-code)')
+    convert_pro_parser.add_argument('--include-empty', action='store_true',
+        help='Include predictions with empty patches')
+
+    # EXPORT-DATASET command
+    export_dataset_parser = subparsers.add_parser('export-dataset',
+        help='Export HuggingFace dataset (or local JSONL) to CSV/JSONL for ScaleAI evaluation')
+    export_dataset_parser.add_argument('--source', type=str,
+        help='Local JSONL file to convert (e.g. sweap_eval_full_v2.jsonl). If omitted, downloads from HuggingFace.')
+    export_dataset_parser.add_argument('--dataset', default='ScaleAI/SWE-bench_Pro',
+        help='HuggingFace dataset name (default: ScaleAI/SWE-bench_Pro)')
+    export_dataset_parser.add_argument('--split', default='test', help='Dataset split (default: test)')
+    export_dataset_parser.add_argument('--format', choices=['csv', 'jsonl'], default='csv',
+        help='Output format (default: csv). CSV recommended for ScaleAI evaluator compatibility.')
+    export_dataset_parser.add_argument('--output', '-o', type=str, help='Output file path')
+    export_dataset_parser.add_argument('--limit', type=int, help='Limit number of instances')
+
     # Shortcut commands
     subparsers.add_parser('quick', help='Quick test (10 instances with eval)')
     subparsers.add_parser('full', help='Full test (300 instances with eval)')
@@ -423,7 +595,10 @@ Examples:
         args.standard = False
         args.full = True
         args.model = None
-    
+        args.mcp = False
+        args.repos = None
+        args.mcp_repos_only = False
+
     # Route to appropriate handler
     if args.command == 'run':
         return run_command(args)
@@ -445,6 +620,9 @@ Examples:
             standard = False
             full = False
             model = None
+            mcp = False
+            repos = None
+            mcp_repos_only = False
         return run_command(QuickArgs())
     elif args.command == 'full':
         # Create args for full command
@@ -458,6 +636,9 @@ Examples:
             standard = False
             full = True
             model = None
+            mcp = False
+            repos = None
+            mcp_repos_only = False
         return run_command(FullArgs())
     elif args.command == 'check':
         # Create args for check command
@@ -469,6 +650,10 @@ Examples:
             export = None
             last = None
         return scores_command(CheckArgs())
+    elif args.command == 'convert-pro':
+        return convert_pro_command(args)
+    elif args.command == 'export-dataset':
+        return export_dataset_command(args)
     elif args.command == 'list-models':
         return list_models_command(args)
     else:
