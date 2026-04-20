@@ -41,15 +41,33 @@ class CodeSWEAgent:
                  repos_filter: Optional[List[str]] = None,
                  mcp_repos_only: bool = False,
                  mcp_config_path: Optional[str] = None,
-                 subprocess_timeout_s: int = 900):
+                 subprocess_timeout_s: int = 900,
+                 env_overrides: Optional[Dict[str, str]] = None,
+                 on_rate_limit_retry: Optional[Callable[[Any], None]] = None):
+        # env_overrides + on_rate_limit_retry are Phase 4 additions. The
+        # worker plumbs per-shard env + a structlog-emitting callback; the
+        # standalone CLI leaves both at None and the behaviour is
+        # identical to P3.
         self.backend = (backend or DEFAULT_BACKEND).lower()
         if self.backend == "codex":
-            self.interface = CodexCodeInterface(timeout_s=subprocess_timeout_s)
+            self.interface = CodexCodeInterface(
+                timeout_s=subprocess_timeout_s,
+                env_overrides=env_overrides,
+                on_rate_limit_retry=on_rate_limit_retry,
+            )
         elif self.backend == "gemini":
-            self.interface = GeminiCodeInterface(timeout_s=subprocess_timeout_s)
+            self.interface = GeminiCodeInterface(
+                timeout_s=subprocess_timeout_s,
+                env_overrides=env_overrides,
+                on_rate_limit_retry=on_rate_limit_retry,
+            )
         else:
             self.backend = "claude"
-            self.interface = ClaudeCodeInterface(timeout_s=subprocess_timeout_s)
+            self.interface = ClaudeCodeInterface(
+                timeout_s=subprocess_timeout_s,
+                env_overrides=env_overrides,
+                on_rate_limit_retry=on_rate_limit_retry,
+            )
 
         self.prompt_formatter = PromptFormatter(prompt_template)
         self.patch_extractor = PatchExtractor()
@@ -407,6 +425,9 @@ def run_shard(
     on_instance_complete: Optional[Callable[[Any], None]] = None,
     on_instance_error: Optional[Callable[[str, Exception, str], None]] = None,
     subprocess_timeout_s: int = 900,
+    api_key: Optional[str] = None,
+    env_overrides: Optional[Dict[str, str]] = None,
+    rate_limit_callback: Optional[Callable[[Any], None]] = None,
 ) -> List[Any]:
     """Shardable library entry point used by the cl-benchmark worker.
 
@@ -416,10 +437,29 @@ def run_shard(
     the worker can write to Postgres + MinIO without the harness knowing
     about either.
 
+    Phase 4 additions:
+      - ``api_key``: informational — the caller's intent to run API-key
+        mode. Not read directly (see ``env_overrides``). Kept as a
+        distinct arg so log output can elide the secret while logging
+        the intent.
+      - ``env_overrides``: merged into each subprocess's ``env=``. The
+        worker injects ``ANTHROPIC_API_KEY`` (or the per-harness
+        equivalent) here and relocates ``HOME``/``XDG_CONFIG_HOME`` to
+        a per-shard sandbox so codex/gemini auth caches don't race and
+        so api_key-claude doesn't pick up a host Max OAuth from
+        ``~/.claude/auth.json``.
+      - ``rate_limit_callback``: invoked per retry with a ``RateLimitEvent``
+        so the worker can emit ``instance.rate_limit_retry`` events.
+
     Returns a list of ``cl_benchmark_core.schemas.library.InstanceRunResult``
     Pydantic models (import is lazy so standalone CLI use of this harness
     does not require ``cl-benchmark-core`` to be installed).
     """
+    # ``api_key`` is currently informational — the actual injection is via
+    # ``env_overrides``. Referencing it here keeps linters quiet and
+    # documents the parameter's role. If we ever want to log the call
+    # without the secret, this is where redaction would land.
+    _ = api_key
     # Lazy import: keeps the harness usable standalone when cl-benchmark-core
     # is not installed (direct CLI / test_sets workflow).
     from cl_benchmark_core.schemas.library import (
@@ -436,6 +476,8 @@ def run_shard(
         mcp_enabled=mcp_enabled,
         mcp_config_path=mcp_config_path,
         subprocess_timeout_s=subprocess_timeout_s,
+        env_overrides=env_overrides,
+        on_rate_limit_retry=rate_limit_callback,
     )
 
     dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")
@@ -473,6 +515,14 @@ def run_shard(
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
+            # Map the harness's rate-limit-exhausted exception to a
+            # first-class ErrorKind so the worker emits a distinctly
+            # filterable event and the UI can surface "hit limits 5x".
+            from utils.retry import RateLimitExhausted  # local import — no cycle
+            if isinstance(exc, RateLimitExhausted):
+                mapped_error_kind = ErrorKind.RATE_LIMIT_EXHAUSTED
+            else:
+                mapped_error_kind = ErrorKind.UNKNOWN
             if on_instance_error is not None:
                 on_instance_error(instance_id, exc, tb)
             result = InstanceRunResult(
@@ -481,7 +531,7 @@ def run_shard(
                 status=LibraryInstanceStatus.ERROR,
                 patch=None,
                 error_message=str(exc),
-                error_kind=ErrorKind.UNKNOWN,
+                error_kind=mapped_error_kind,
                 duration_ms=int((time.monotonic() - start_monotonic) * 1000),
                 raw_stderr=tb,
             )
