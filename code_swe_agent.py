@@ -174,7 +174,25 @@ class CodeSWEAgent:
                 print(msg)
                 return None, "\n".join(stdout_parts), "\n".join(stderr_parts)
 
-            # Checkout base commit
+            # Checkout base commit.
+            #
+            # Some repos (notably ProtonMail/WebClients) have GitLab
+            # mirrors whose merge bot rewrites ``main`` via rebase +
+            # force-push. Intermediate merge commits get orphaned on
+            # GitHub — they survive in the object database (the REST
+            # API still serves them) but aren't reachable from any ref,
+            # so a fresh clone's working tree doesn't have them. When
+            # the dataset's ``base_commit`` was captured at an
+            # intermediate state, ``git checkout <sha>`` fails with
+            # ``reference is not a tree``.
+            #
+            # GitHub's ``uploadpack.allowAnySHA1InWant`` (enabled by
+            # default on public repos) lets us ``git fetch origin
+            # <sha>`` to pull the orphan directly. After that, the
+            # object lives in the local store and checkout succeeds.
+            # We try the cheap path first (plain checkout) and only
+            # run the fetch on failure, so most repos pay zero extra
+            # latency for this fallback.
             os.chdir(temp_dir)
             result = subprocess.run(
                 ["git", "checkout", base_commit],
@@ -183,6 +201,27 @@ class CodeSWEAgent:
             )
             stdout_parts.append(result.stdout or "")
             stderr_parts.append(result.stderr or "")
+
+            if result.returncode != 0:
+                _log_header(
+                    f"Checkout failed, attempting direct fetch of {base_commit} "
+                    f"(likely an orphan commit — fell off main via force-push)"
+                )
+                fetch = subprocess.run(
+                    ["git", "fetch", "origin", base_commit],
+                    capture_output=True,
+                    text=True,
+                )
+                stdout_parts.append(fetch.stdout or "")
+                stderr_parts.append(fetch.stderr or "")
+                if fetch.returncode == 0:
+                    result = subprocess.run(
+                        ["git", "checkout", base_commit],
+                        capture_output=True,
+                        text=True,
+                    )
+                    stdout_parts.append(result.stdout or "")
+                    stderr_parts.append(result.stderr or "")
 
             if result.returncode != 0:
                 msg = f"Failed to checkout commit {base_commit}: {result.stderr}"
