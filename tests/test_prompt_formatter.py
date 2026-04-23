@@ -141,6 +141,55 @@ def test_format_issue_keeps_hints_text_appended_after_enriched_body():
     ) < prompt.index("Hints:")
 
 
+def test_format_issue_drops_being_evaluated_framing():
+    """Pro-os never tells its agent the task is a benchmark — our
+    template dropped ``You are being evaluated on SWE-bench`` to align.
+    Regression guard against the string sneaking back in via a future
+    template edit."""
+    formatter = PromptFormatter()
+    prompt = formatter.format_issue({
+        "instance_id": "x",
+        "repo": "acme/widget",
+        "base_commit": "",
+        "problem_statement": "Fix the bug.",
+    })
+    assert "being evaluated" not in prompt.lower()
+    assert "swe-bench" not in prompt.lower()
+
+
+def test_format_issue_includes_dont_touch_tests_nudge():
+    """Matches Pro-os's ``tool_use.yaml`` directive: test files are
+    off-limits to the agent. Regression guard against the nudge being
+    dropped in a future edit."""
+    formatter = PromptFormatter()
+    prompt = formatter.format_issue({
+        "instance_id": "x",
+        "repo": "acme/widget",
+        "base_commit": "",
+        "problem_statement": "Fix the bug.",
+    })
+    # Two-part nudge: claim tests are already handled, then the
+    # explicit "don't modify tests" directive.
+    assert "I've already taken care of" in prompt
+    assert "DON'T have to modify the testing logic" in prompt
+    assert "non-test files" in prompt
+
+
+def test_format_issue_drops_conflicting_tests_should_pass_note():
+    """The old Important-notes line ``The tests should pass after
+    applying your fix`` conflicted with the don't-touch-tests nudge
+    (pass-tests → maybe edit tests). Regression guard that the line
+    stays removed."""
+    formatter = PromptFormatter()
+    prompt = formatter.format_issue({
+        "instance_id": "x",
+        "repo": "acme/widget",
+        "base_commit": "",
+        "problem_statement": "Fix the bug.",
+    })
+    assert "tests should pass after applying" not in prompt
+
+
 def test_format_issue_issue_title_is_first_line_of_problem_statement_only():
     """``issue_title`` in the template is still the first line of the
     *original* problem_statement — enriching the body shouldn't

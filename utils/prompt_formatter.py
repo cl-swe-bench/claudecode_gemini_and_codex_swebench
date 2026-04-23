@@ -55,14 +55,32 @@ class PromptFormatter:
             except FileNotFoundError:
                 pass
         
-        # Default template if no file provided
-        return """You are being evaluated on SWE-bench. You have access to a repository with a software issue that needs to be fixed.
+        # Default template.
+        #
+        # Aligned with SWE-bench_Pro-os's `tool_use.yaml` instance
+        # template in two ways:
+        #   * No "being evaluated on SWE-bench" framing. Pro-os never
+        #     tells its agent the task is a benchmark; doing so leaks
+        #     meta-context and may nudge the model to behave
+        #     differently (more cautious, more verbose) than the
+        #     reference runs. Opening sentence just describes the
+        #     workspace.
+        #   * Don't-touch-tests nudge lifted from Pro-os verbatim.
+        #     The statement is a directional nudge (Pro-os's flow
+        #     doesn't actually apply test_patch before the agent
+        #     runs either — ours doesn't either; the evaluator
+        #     re-applies test_patch at grading time in both flows).
+        #     Dropping the old "tests should pass after applying
+        #     your fix" note that conflicted with the nudge.
+        return """You have access to a repository with a software issue that needs to be fixed.
 
 Repository: {repo_name}
 Issue: {issue_title}
 
 Issue Description:
 {issue_description}
+
+I've already taken care of all changes to any of the test files described in the issue description. This means you DON'T have to modify the testing logic or any of the tests in any way. Your task is to make the minimal changes to non-test files in the repository to satisfy the issue description.
 
 Your task:
 1. Understand the issue by carefully reading the description
@@ -74,7 +92,6 @@ Your task:
 Important notes:
 - Focus on making minimal, targeted changes
 - Consider edge cases and potential side effects
-- The tests should pass after applying your fix
 - Output clear file edits showing exactly what needs to be changed
 
 Base directory: {base_path}
