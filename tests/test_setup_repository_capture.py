@@ -92,6 +92,88 @@ def test_setup_repository_returns_triple_on_checkout_failure(agent, monkeypatch)
     assert any(c[:2] == ["git", "checkout"] for c in calls)
 
 
+def test_setup_repository_retries_with_fetch_when_checkout_orphans(agent, monkeypatch):
+    """ProtonMail/WebClients-style failure: the first ``git checkout``
+    fails because the base commit is orphaned on GitHub (GitLab mirror
+    force-pushed main). ``setup_repository`` should fall back to
+    ``git fetch origin <sha>`` and retry the checkout — the fetch
+    pulls the orphan from the object DB, and the retry succeeds.
+
+    Regression guard for the webclients 65/65 bug.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["git", "clone"]:
+            os.makedirs(cmd[-1], exist_ok=True)
+            return _CR(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["git", "checkout"]:
+            # First checkout fails (orphan); second (post-fetch)
+            # succeeds. Count prior checkout calls to branch.
+            prior_checkouts = sum(1 for c in calls[:-1] if c[:2] == ["git", "checkout"])
+            if prior_checkouts == 0:
+                return _CR(
+                    returncode=128,
+                    stdout="",
+                    stderr="fatal: reference is not a tree: deadbeefdeadbeef\n",
+                )
+            return _CR(returncode=0, stdout="HEAD is now at deadbeef\n", stderr="")
+        if cmd[:3] == ["git", "fetch", "origin"]:
+            return _CR(returncode=0, stdout="", stderr="* branch deadbeef -> FETCH_HEAD\n")
+        return _CR(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    path, stdout, stderr = agent.setup_repository(_instance())
+
+    # Both the fetch and the retry happened.
+    assert any(c[:3] == ["git", "fetch", "origin"] for c in calls), "fetch was not attempted"
+    checkouts = [c for c in calls if c[:2] == ["git", "checkout"]]
+    assert len(checkouts) == 2, f"expected 2 checkouts (fail → fetch → retry), got {len(checkouts)}"
+    # Setup is considered successful — path is the temp dir, no final error.
+    assert path is not None
+    # Human-readable fallback hint is captured in the setup stdout so
+    # the UI's Setup tab explains why the fetch happened.
+    assert "likely an orphan commit" in stdout
+
+
+def test_setup_repository_surfaces_error_when_fetch_also_fails(agent, monkeypatch):
+    """If the fetch fallback also fails (e.g. truly deleted commit or
+    network issue), the error bubbles up with the fetch stderr captured
+    alongside the original checkout stderr so the UI can diagnose."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["git", "clone"]:
+            os.makedirs(cmd[-1], exist_ok=True)
+            return _CR(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["git", "checkout"]:
+            return _CR(
+                returncode=128,
+                stdout="",
+                stderr="fatal: reference is not a tree: deadbeef\n",
+            )
+        if cmd[:3] == ["git", "fetch", "origin"]:
+            return _CR(
+                returncode=128,
+                stdout="",
+                stderr="fatal: remote error: upload-pack: not our ref\n",
+            )
+        return _CR(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    path, stdout, stderr = agent.setup_repository(_instance())
+    assert path is None
+    # Both errors captured so whoever reads the Setup tab sees the
+    # full trail: initial checkout failure → fetch attempt → fetch
+    # failure → final failure.
+    assert "reference is not a tree" in stderr
+    assert "not our ref" in stderr
+
+
 def test_setup_repository_success(agent, monkeypatch, tmp_path):
     def fake_run(cmd, *args, **kwargs):
         if cmd[:2] == ["git", "clone"]:
