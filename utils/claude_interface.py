@@ -4,6 +4,7 @@ import subprocess
 from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 
+from utils.cancellable_subprocess import run_with_cancel
 from utils.retry import (
     ClaudeRateLimitDetector,
     RateLimitEvent,
@@ -23,6 +24,7 @@ class ClaudeCodeInterface:
         env_overrides: Optional[Dict[str, str]] = None,
         retry_policy: Optional[RateLimitPolicy] = None,
         on_rate_limit_retry: Optional[Callable[[RateLimitEvent], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ):
         """Ensure the Claude CLI is available on the system.
 
@@ -38,11 +40,20 @@ class ClaudeCodeInterface:
             retry_policy / on_rate_limit_retry: Phase 4 rate-limit retry
                 policy + callback. Defaults: 5 retries, exponential
                 backoff with jitter, honoring parsed ``Retry-After``.
+            is_cancelled: Bug 1 (2026-04). Predicate the worker plumbs
+                through so a cancel request reaches the live CLI
+                subprocess — when True mid-run, we SIGTERM the CLI's
+                process group + wait a grace period before SIGKILL.
+                Without this, a long ``claude -p`` session can keep a
+                cancelled shard running for many minutes while the
+                worker's between-instance cancel check waits for the
+                current invocation to finish on its own.
         """
         self.timeout_s = timeout_s
         self.env_overrides: Dict[str, str] = dict(env_overrides) if env_overrides else {}
         self.retry_policy = retry_policy or RateLimitPolicy()
         self.on_rate_limit_retry = on_rate_limit_retry
+        self.is_cancelled = is_cancelled
         self._detector = ClaudeRateLimitDetector()
         try:
             result = subprocess.run([
@@ -71,101 +82,40 @@ class ClaudeCodeInterface:
             policy=self.retry_policy,
             on_retry=self.on_rate_limit_retry,
             interface="claude",
+            is_cancelled=self.is_cancelled,
         )
 
     def _single_invocation(
         self, prompt: str, cwd: str, model: Optional[str]
     ) -> Dict[str, Any]:
         """One ``claude -p`` subprocess call, wrapped by the retry loop."""
+        # Build command with optional model parameter. Use -p (print
+        # mode) with --output-format json for structured output.
+        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        if model:
+            cmd.extend(["--model", model])
+
+        # Phase 4: merge env_overrides into the current process env so the
+        # CLI picks up per-shard ``HOME``/``XDG_CONFIG_HOME`` + the
+        # ``ANTHROPIC_API_KEY``. Passing ``env=None`` preserves current
+        # behaviour when there are no overrides.
+        env = {**os.environ, **self.env_overrides} if self.env_overrides else None
+
         try:
-            # Save the current directory
-            original_cwd = os.getcwd()
-
-            # Change to the working directory
-            os.chdir(cwd)
-
-            # Build command with optional model parameter
-            # Use -p (print mode) with --output-format json for structured output
-            cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
-            if model:
-                cmd.extend(["--model", model])
-
-            # Phase 4: merge env_overrides into the current process env so the
-            # CLI picks up per-shard ``HOME``/``XDG_CONFIG_HOME`` + the
-            # ``ANTHROPIC_API_KEY``. Passing ``env=None`` preserves current
-            # behaviour when there are no overrides.
-            env = {**os.environ, **self.env_overrides} if self.env_overrides else None
-
-            # Execute claude command with the prompt via stdin
-            result = subprocess.run(
+            # Bug 1 (2026-04): ``run_with_cancel`` replaces the plain
+            # ``subprocess.run`` so a cancel from the worker SIGTERMs the
+            # CLI's process group instead of waiting out the 15-min
+            # session. ``is_cancelled`` may be None — the helper
+            # collapses to the old behavior in that case.
+            result = run_with_cancel(
                 cmd,
                 input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_s,
+                cwd=cwd,
                 env=env,
+                timeout_s=self.timeout_s,
+                is_cancelled=self.is_cancelled,
             )
-
-            # Restore original directory
-            os.chdir(original_cwd)
-
-            # Parse JSON output for token usage and metadata
-            # Claude Code -p --output-format json returns:
-            # {
-            #   "result": "...", "num_turns": N, "duration_ms": N,
-            #   "duration_api_ms": N, "is_error": bool, "session_id": "...",
-            #   "total_cost_usd": N.NN,
-            #   "usage": { "input_tokens": N, "output_tokens": N,
-            #              "cache_creation_input_tokens": N, "cache_read_input_tokens": N }
-            # }
-            token_usage = {}
-            if result.stdout:
-                try:
-                    output_data = json.loads(result.stdout)
-                    if isinstance(output_data, dict):
-                        usage = output_data.get("usage") or {}
-                        input_tokens = usage.get("input_tokens", 0)
-                        output_tokens = usage.get("output_tokens", 0)
-                        token_usage = {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "total_tokens": input_tokens + output_tokens,
-                            "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
-                            "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
-                        }
-                        if output_data.get("total_cost_usd") is not None:
-                            token_usage["cost_usd"] = output_data["total_cost_usd"]
-                        if output_data.get("num_turns") is not None:
-                            token_usage["num_turns"] = output_data["num_turns"]
-                        if output_data.get("duration_ms") is not None:
-                            token_usage["duration_ms"] = output_data["duration_ms"]
-                        if output_data.get("duration_api_ms") is not None:
-                            token_usage["duration_api_ms"] = output_data["duration_api_ms"]
-                        if output_data.get("session_id") is not None:
-                            token_usage["session_id"] = output_data["session_id"]
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass  # Fall back to no token tracking
-
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
-                "token_usage": token_usage,
-            }
-
-        except subprocess.TimeoutExpired:
-            os.chdir(original_cwd)
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Command timed out after {self.timeout_s} seconds",
-                "returncode": -1,
-                "token_usage": {},
-                "timed_out": True,
-            }
         except Exception as e:
-            os.chdir(original_cwd)
             return {
                 "success": False,
                 "stdout": "",
@@ -173,6 +123,73 @@ class ClaudeCodeInterface:
                 "returncode": -1,
                 "token_usage": {},
             }
+
+        if result.timed_out:
+            return {
+                "success": False,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": -1,
+                "token_usage": {},
+                "timed_out": True,
+            }
+
+        if result.cancelled:
+            # Surface the cancel flag all the way up — with_rate_limit_retry
+            # + process_instance + run_shard all key off it.
+            return {
+                "success": False,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+                "token_usage": {},
+                "cancelled": True,
+            }
+
+        # Parse JSON output for token usage and metadata
+        # Claude Code -p --output-format json returns:
+        # {
+        #   "result": "...", "num_turns": N, "duration_ms": N,
+        #   "duration_api_ms": N, "is_error": bool, "session_id": "...",
+        #   "total_cost_usd": N.NN,
+        #   "usage": { "input_tokens": N, "output_tokens": N,
+        #              "cache_creation_input_tokens": N, "cache_read_input_tokens": N }
+        # }
+        token_usage = {}
+        if result.stdout:
+            try:
+                output_data = json.loads(result.stdout)
+                if isinstance(output_data, dict):
+                    usage = output_data.get("usage") or {}
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+                    token_usage = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                        "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
+                        "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
+                    }
+                    if output_data.get("total_cost_usd") is not None:
+                        token_usage["cost_usd"] = output_data["total_cost_usd"]
+                    if output_data.get("num_turns") is not None:
+                        token_usage["num_turns"] = output_data["num_turns"]
+                    if output_data.get("duration_ms") is not None:
+                        token_usage["duration_ms"] = output_data["duration_ms"]
+                    if output_data.get("duration_api_ms") is not None:
+                        token_usage["duration_api_ms"] = output_data["duration_api_ms"]
+                    if output_data.get("session_id") is not None:
+                        token_usage["session_id"] = output_data["session_id"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass  # Fall back to no token tracking
+
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+            "token_usage": token_usage,
+        }
 
     def extract_file_changes(self, response: str) -> List[Dict[str, str]]:
         """Extract file changes from Claude's response."""

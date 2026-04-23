@@ -2,6 +2,7 @@ import os
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
+from utils.cancellable_subprocess import run_with_cancel
 from utils.retry import (
     CodexRateLimitDetector,
     RateLimitEvent,
@@ -19,12 +20,19 @@ class CodexCodeInterface:
         env_overrides: Optional[Dict[str, str]] = None,
         retry_policy: Optional[RateLimitPolicy] = None,
         on_rate_limit_retry: Optional[Callable[[RateLimitEvent], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ):
-        """Ensure the Codex CLI is available on the system."""
+        """Ensure the Codex CLI is available on the system.
+
+        ``is_cancelled``: Bug 1 predicate — when True mid-run, the CLI
+        subprocess's process group is SIGTERMed + (if stubborn)
+        SIGKILLed. See ``ClaudeCodeInterface`` for the full contract.
+        """
         self.timeout_s = timeout_s
         self.env_overrides: Dict[str, str] = dict(env_overrides) if env_overrides else {}
         self.retry_policy = retry_policy or RateLimitPolicy()
         self.on_rate_limit_retry = on_rate_limit_retry
+        self.is_cancelled = is_cancelled
         self._detector = CodexRateLimitDetector()
         try:
             result = subprocess.run(["codex", "--version"], capture_output=True, text=True)
@@ -45,50 +53,54 @@ class CodexCodeInterface:
             policy=self.retry_policy,
             on_retry=self.on_rate_limit_retry,
             interface="codex",
+            is_cancelled=self.is_cancelled,
         )
 
     def _single_invocation(
         self, prompt: str, cwd: str, model: Optional[str]
     ) -> Dict[str, Any]:
+        cmd = ["codex"]
+        if model:
+            cmd.extend(["--model", model])
+        env = {**os.environ, **self.env_overrides} if self.env_overrides else None
         try:
-            original_cwd = os.getcwd()
-            os.chdir(cwd)
-            cmd = ["codex"]
-            if model:
-                cmd.extend(["--model", model])
-            env = {**os.environ, **self.env_overrides} if self.env_overrides else None
-            result = subprocess.run(
+            result = run_with_cancel(
                 cmd,
                 input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_s,
+                cwd=cwd,
                 env=env,
+                timeout_s=self.timeout_s,
+                is_cancelled=self.is_cancelled,
             )
-            os.chdir(original_cwd)
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            os.chdir(original_cwd)
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Command timed out after {self.timeout_s} seconds",
-                "returncode": -1,
-                "timed_out": True,
-            }
         except Exception as e:
-            os.chdir(original_cwd)
             return {
                 "success": False,
                 "stdout": "",
                 "stderr": str(e),
                 "returncode": -1,
             }
+        if result.timed_out:
+            return {
+                "success": False,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": -1,
+                "timed_out": True,
+            }
+        if result.cancelled:
+            return {
+                "success": False,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+                "cancelled": True,
+            }
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
 
     def extract_file_changes(self, response: str) -> List[Dict[str, str]]:
         """Extract file changes from Codex's response (placeholder)."""
