@@ -2,6 +2,43 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
+
+def _concat_problem_statement(
+    *,
+    problem_statement: str,
+    requirements: Optional[str],
+    interface: Optional[str],
+) -> str:
+    """Mirror SWE-bench_Pro-os's ``create_problem_statement`` concat so
+    our agent sees the same contract SWE-agent does on Pro runs.
+
+    Upstream (``SWE-bench_Pro-os/helper_code/create_problem_statement.py``)
+    builds the string as::
+
+        {problem_statement}
+
+        Requirements:
+        {requirements}
+
+        New interfaces introduced:
+        {interface}
+
+    Pro ships both ``requirements`` (~3.6 KB of contract prose) and
+    ``interface`` (~1 KB of API-shape prose) populated on every row. Lite
+    and older Pro snapshots don't carry them, so missing / empty fields
+    fall through to just ``problem_statement`` unchanged — no change in
+    behavior for Lite runs. Whitespace-only values are treated as empty.
+    """
+    parts = [problem_statement or ""]
+    req = (requirements or "").strip()
+    if req:
+        parts.append(f"\n\nRequirements:\n{req}")
+    iface = (interface or "").strip()
+    if iface:
+        parts.append(f"\n\nNew interfaces introduced:\n{iface}")
+    return "".join(parts)
+
+
 class PromptFormatter:
     """Format SWE-bench issues into prompts for Claude Code."""
     
@@ -47,13 +84,25 @@ Base directory: {base_path}
         """Format a SWE-bench instance into a prompt for Claude Code."""
         # Extract key information from the instance
         repo_name = instance.get("repo", "")
-        issue_title = instance.get("problem_statement", "").split('\n')[0]
-        issue_description = instance.get("problem_statement", "")
+        problem_statement = instance.get("problem_statement", "")
+        issue_title = problem_statement.split('\n')[0]
+        # SWE-bench Pro ships ``requirements`` + ``interface`` fields
+        # alongside ``problem_statement``. Upstream Pro-os's
+        # ``helper_code/create_problem_statement.py`` concatenates all
+        # three into the prompt body — mirror that here so our agent
+        # sees the same contract as SWE-agent on Pro runs. Lite rows +
+        # older dataset snapshots don't carry these keys; the helper
+        # falls through to just ``problem_statement`` unchanged.
+        issue_description = _concat_problem_statement(
+            problem_statement=problem_statement,
+            requirements=instance.get("requirements"),
+            interface=instance.get("interface"),
+        )
         base_commit = instance.get("base_commit", "")
-        
+
         # Get instance_id for tracking
         instance_id = instance.get("instance_id", "")
-        
+
         # Format the prompt
         base_path = Path(tempfile.gettempdir()) / f"swe_bench_{instance_id}"
 
@@ -65,11 +114,11 @@ Base directory: {base_path}
             instance_id=instance_id,
             base_commit=base_commit,
         )
-        
+
         # Add any hints if available
         if "hints_text" in instance and instance["hints_text"]:
             prompt += f"\n\nHints:\n{instance['hints_text']}"
-            
+
         return prompt
     
     def format_for_cli(self, instance: Dict) -> str:

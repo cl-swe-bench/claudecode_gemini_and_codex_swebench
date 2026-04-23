@@ -106,8 +106,12 @@ def test_setup_repository_success(agent, monkeypatch, tmp_path):
     assert stderr.strip() == ""
 
 
-def test_process_instance_threads_stderr_into_raw_stderr(agent, monkeypatch):
-    """End-to-end: setup fails → early-return dict carries raw_stderr."""
+def test_process_instance_threads_stderr_into_setup_stderr(agent, monkeypatch):
+    """End-to-end: setup fails → early-return dict carries the git
+    stderr on ``setup_stderr`` (slice C moved setup output off of
+    ``raw_stderr`` so the UI's Setup tab could render it distinctly
+    from the CLI log). ``raw_stdout`` / ``raw_stderr`` stay empty
+    because the CLI never ran."""
 
     def fake_run(cmd, *args, **kwargs):
         return _CR(returncode=128, stdout="", stderr="fatal: repository not found\n")
@@ -118,8 +122,11 @@ def test_process_instance_threads_stderr_into_raw_stderr(agent, monkeypatch):
         prediction = agent.process_instance(_instance())
 
     assert prediction["error"].startswith("fatal:") or "repository" in prediction["error"]
-    assert "fatal: repository not found" in prediction["raw_stderr"]
-    assert "Cloning acme/widget" in prediction["raw_stdout"]
+    # Post-slice-C: setup streams on setup_std*, CLI streams empty.
+    assert "fatal: repository not found" in prediction["setup_stderr"]
+    assert "Cloning acme/widget" in prediction["setup_stdout"]
+    assert prediction["raw_stdout"] == ""
+    assert prediction["raw_stderr"] == ""
 
 
 def test_process_instance_error_summary_prefers_fatal_line(agent, monkeypatch):
