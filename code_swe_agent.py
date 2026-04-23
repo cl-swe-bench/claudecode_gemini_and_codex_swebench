@@ -12,7 +12,7 @@ import tempfile
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Callable, List, Dict, Optional
+from typing import Any, Callable, List, Dict, Optional, Tuple
 from pathlib import Path
 
 from datasets import load_dataset
@@ -43,23 +43,30 @@ class CodeSWEAgent:
                  mcp_config_path: Optional[str] = None,
                  subprocess_timeout_s: int = 900,
                  env_overrides: Optional[Dict[str, str]] = None,
-                 on_rate_limit_retry: Optional[Callable[[Any], None]] = None):
+                 on_rate_limit_retry: Optional[Callable[[Any], None]] = None,
+                 is_cancelled: Optional[Callable[[], bool]] = None):
         # env_overrides + on_rate_limit_retry are Phase 4 additions. The
         # worker plumbs per-shard env + a structlog-emitting callback; the
         # standalone CLI leaves both at None and the behaviour is
-        # identical to P3.
+        # identical to P3. ``is_cancelled`` is Bug 1 (2026-04): the
+        # worker flips an ``threading.Event`` closure True when the DB
+        # status moves to ``cancel_requested``, and the interface's
+        # ``run_with_cancel`` SIGTERMs the live CLI process group.
+        self.is_cancelled = is_cancelled
         self.backend = (backend or DEFAULT_BACKEND).lower()
         if self.backend == "codex":
             self.interface = CodexCodeInterface(
                 timeout_s=subprocess_timeout_s,
                 env_overrides=env_overrides,
                 on_rate_limit_retry=on_rate_limit_retry,
+                is_cancelled=is_cancelled,
             )
         elif self.backend == "gemini":
             self.interface = GeminiCodeInterface(
                 timeout_s=subprocess_timeout_s,
                 env_overrides=env_overrides,
                 on_rate_limit_retry=on_rate_limit_retry,
+                is_cancelled=is_cancelled,
             )
         else:
             self.backend = "claude"
@@ -67,6 +74,7 @@ class CodeSWEAgent:
                 timeout_s=subprocess_timeout_s,
                 env_overrides=env_overrides,
                 on_rate_limit_retry=on_rate_limit_retry,
+                is_cancelled=is_cancelled,
             )
 
         self.prompt_formatter = PromptFormatter(prompt_template)
@@ -113,14 +121,31 @@ class CodeSWEAgent:
         self.pred_timestamp: Optional[str] = None
         self.pred_file: Optional[Path] = None
 
-    def setup_repository(self, instance: Dict) -> Optional[str]:
-        """Set up a repository for testing."""
+    def setup_repository(self, instance: Dict) -> Tuple[Optional[str], str, str]:
+        """Set up a repository for testing.
+
+        Returns a ``(path, stdout, stderr)`` triple. On failure ``path`` is
+        ``None`` and the stderr string carries whatever git (or the
+        surrounding ``except``) wrote — callers bubble that up as
+        ``raw_stderr`` so downstream log uploads + the run-detail UI show
+        the real reason rather than a generic "Failed to set up
+        repository" string.
+        """
         instance_id = instance["instance_id"]
         repo_name = instance["repo"]
         base_commit = instance["base_commit"]
 
         # Create temporary directory for this instance (cross-platform)
         temp_dir = Path(tempfile.gettempdir()) / f"swe_bench_{instance_id}"
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        def _log_header(msg: str) -> None:
+            # Keep the human-readable trail in the captured stdout too so
+            # the blob reads like a debug session.
+            stdout_parts.append(msg)
+            print(msg)
 
         try:
             # Remove if exists
@@ -129,22 +154,26 @@ class CodeSWEAgent:
 
             # Save current directory
             original_dir = Path.cwd()
-            
+
             # Clone repository
-            print(f"Cloning {repo_name} to {temp_dir}")
+            _log_header(f"Cloning {repo_name} to {temp_dir}")
             clone_url = f"https://github.com/{repo_name}.git"
-            
+
             result = subprocess.run(
                 ["git", "clone", clone_url, str(temp_dir)],
                 capture_output=True,
                 text=True,
                 cwd=str(original_dir)  # Ensure we're in a valid directory
             )
-            
+            stdout_parts.append(result.stdout or "")
+            stderr_parts.append(result.stderr or "")
+
             if result.returncode != 0:
-                print(f"Failed to clone repository: {result.stderr}")
-                return None
-                
+                msg = f"Failed to clone repository: {result.stderr}"
+                stderr_parts.append(msg)
+                print(msg)
+                return None, "\n".join(stdout_parts), "\n".join(stderr_parts)
+
             # Checkout base commit
             os.chdir(temp_dir)
             result = subprocess.run(
@@ -152,23 +181,34 @@ class CodeSWEAgent:
                 capture_output=True,
                 text=True
             )
-            
+            stdout_parts.append(result.stdout or "")
+            stderr_parts.append(result.stderr or "")
+
             if result.returncode != 0:
-                print(f"Failed to checkout commit: {result.stderr}")
+                msg = f"Failed to checkout commit {base_commit}: {result.stderr}"
+                stderr_parts.append(msg)
+                print(msg)
                 os.chdir(str(original_dir))  # Return to original directory
-                return None
+                return None, "\n".join(stdout_parts), "\n".join(stderr_parts)
 
             os.chdir(str(original_dir))  # Return to original directory
-            return str(temp_dir)
-            
+            return str(temp_dir), "\n".join(stdout_parts), "\n".join(stderr_parts)
+
         except Exception as e:
-            print(f"Error setting up repository: {e}")
+            import traceback as _tb
+            tb = _tb.format_exc()
+            msg = f"Error setting up repository: {e}"
+            stderr_parts.append(msg)
+            stderr_parts.append(tb)
+            print(msg)
             # Try to return to original directory if possible
             try:
                 os.chdir(str(original_dir))
             except Exception as chdir_error:
-                print(f"Warning: Failed to return to original directory: {chdir_error}")
-            return None
+                chdir_msg = f"Warning: Failed to return to original directory: {chdir_error}"
+                stderr_parts.append(chdir_msg)
+                print(chdir_msg)
+            return None, "\n".join(stdout_parts), "\n".join(stderr_parts)
             
     def process_instance(self, instance: Dict) -> Dict:
         """Process a single SWE-bench instance."""
@@ -177,16 +217,55 @@ class CodeSWEAgent:
 
         original_dir = os.getcwd()
 
-        repo_path = self.setup_repository(instance)
+        # Task-context metadata the dataset carries. Included on every
+        # return path (setup failure, CLI failure, success, exception)
+        # so ``run_shard`` can plumb it into ``InstanceRunResult``
+        # regardless of outcome — cl-benchmark's Task tab renders these
+        # above the patch for "what was the agent asked to do?" context.
+        # Normalize "" → None so pydantic's optional fields don't store
+        # empty strings that render as a blank tab.
+        task_context = {
+            "problem_statement": (instance.get("problem_statement") or None),
+            "hints_text": (instance.get("hints_text") or None),
+            "base_commit": (instance.get("base_commit") or None),
+            # ``formatted_prompt`` is filled in only for paths that
+            # reached prompt formatting. Setup failures leave it None.
+            "formatted_prompt": None,
+        }
+
+        repo_path, setup_stdout, setup_stderr = self.setup_repository(instance)
+        # Slice C: setup-phase streams travel on their own keys so the
+        # UI's Setup tab can render them distinctly from CLI output.
+        # Included on every return path so the Setup tab has something
+        # to show even on happy runs (git clone progress is often non-
+        # empty and occasionally useful for "why did clone take so long").
+        setup_streams = {
+            "setup_stdout": setup_stdout,
+            "setup_stderr": setup_stderr,
+        }
         if not repo_path:
+            # Pull a one-line summary out of the captured stderr so the
+            # DB's ``error`` column (80-char tail) surfaces the actual git
+            # failure rather than the generic "Failed to set up
+            # repository" string.
+            summary = "Failed to set up repository"
+            for line in reversed(setup_stderr.splitlines()):
+                line = line.strip()
+                if line and "fatal:" in line:
+                    summary = line
+                    break
             return {
                 "instance_id": instance_id,
                 "model": f"{self.backend}-code",
                 "prediction": "",
-                "error": "Failed to set up repository",
+                "error": summary,
                 "token_usage": {},
+                # CLI never ran — leave the CLI streams empty; the Setup
+                # streams below carry the actual git-clone failure bytes.
                 "raw_stdout": "",
                 "raw_stderr": "",
+                **setup_streams,
+                **task_context,
             }
 
         try:
@@ -197,6 +276,10 @@ class CodeSWEAgent:
                 McpConfigManager.remove_mcp_json(repo_path)
 
             prompt = self.prompt_formatter.format_for_cli(instance)
+            # Capture the prompt bytes we actually sent. The formatter
+            # already merged the template + issue + hints; this is what
+            # the CLI reads from stdin.
+            task_context["formatted_prompt"] = prompt
 
             os.chdir(repo_path)
             subprocess.run(["git", "add", "-A"], capture_output=True)
@@ -220,6 +303,8 @@ class CodeSWEAgent:
                     "raw_stdout": result.get("stdout", "") or "",
                     "raw_stderr": result.get("stderr", "") or "",
                     "timed_out": bool(result.get("timed_out")),
+                    **setup_streams,
+                    **task_context,
                 }
 
             # Extract patch from git diff (works regardless of output format)
@@ -236,6 +321,8 @@ class CodeSWEAgent:
             prediction["token_usage"] = token_usage
             prediction["raw_stdout"] = result.get("stdout", "") or ""
             prediction["raw_stderr"] = result.get("stderr", "") or ""
+            prediction.update(setup_streams)
+            prediction.update(task_context)
 
             self._save_result(instance_id, result, patch)
 
@@ -253,6 +340,8 @@ class CodeSWEAgent:
                 "token_usage": {},
                 "raw_stdout": "",
                 "raw_stderr": "",
+                **setup_streams,
+                **task_context,
             }
         finally:
             try:
@@ -428,6 +517,7 @@ def run_shard(
     api_key: Optional[str] = None,
     env_overrides: Optional[Dict[str, str]] = None,
     rate_limit_callback: Optional[Callable[[Any], None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> List[Any]:
     """Shardable library entry point used by the cl-benchmark worker.
 
@@ -478,6 +568,7 @@ def run_shard(
         subprocess_timeout_s=subprocess_timeout_s,
         env_overrides=env_overrides,
         on_rate_limit_retry=rate_limit_callback,
+        is_cancelled=is_cancelled,
     )
 
     dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")
@@ -488,6 +579,14 @@ def run_shard(
     results: List[InstanceRunResult] = []
 
     for instance_id in instance_ids:
+        # Bug 1: between-instance cancel check. If the worker flipped
+        # the cancel predicate during a prior instance's run (or just
+        # set it before this shard started), stop before spawning the
+        # CLI for the next instance. The worker's own cancel check
+        # between instances also catches this — duplicate here is a
+        # belt-and-braces exit so the CLI subprocess never spawns.
+        if is_cancelled is not None and is_cancelled():
+            break
         instance = by_id.get(instance_id)
         if instance is None:
             err = LookupError(f"instance_id '{instance_id}' not in {dataset_name}@{dataset_revision}")
@@ -534,6 +633,14 @@ def run_shard(
                 error_kind=mapped_error_kind,
                 duration_ms=int((time.monotonic() - start_monotonic) * 1000),
                 raw_stderr=tb,
+                # Even on unhandled exceptions we still have the dataset
+                # row — surface the task context so the Task tab isn't
+                # blank on crash rows. ``formatted_prompt`` may or may
+                # not have been built yet; we don't have visibility into
+                # how far ``process_instance`` got, so leave it None.
+                problem_statement=(instance.get("problem_statement") or None),
+                hints_text=(instance.get("hints_text") or None),
+                base_commit=(instance.get("base_commit") or None),
             )
             results.append(result)
             if on_instance_complete is not None:
@@ -570,9 +677,15 @@ def run_shard(
             error_kind = None
             result_patch = patch
         else:
+            # CLI exited cleanly (no ``prediction.error``) but the extractor
+            # returned an empty string — i.e. ``git diff HEAD`` in the
+            # instance clone dir produced zero bytes. This is a reliability
+            # signal (agent ran to completion without making net file
+            # changes), NOT a parser crash. ``PARSING_ERROR`` is reserved
+            # for the extractor-couldn't-read case.
             status = LibraryInstanceStatus.ERROR
             error_message = "no patch produced"
-            error_kind = ErrorKind.PARSING_ERROR
+            error_kind = ErrorKind.EMPTY_PATCH
             result_patch = None
 
         result = InstanceRunResult(
@@ -587,6 +700,20 @@ def run_shard(
             raw_stderr=raw_stderr,
             error_message=error_message,
             error_kind=error_kind,
+            # Task context — ``process_instance`` populates these on
+            # every return path (setup, CLI, success). None for pre-B
+            # harness builds since the keys simply don't exist on the
+            # returned dict.
+            problem_statement=prediction.get("problem_statement"),
+            hints_text=prediction.get("hints_text"),
+            base_commit=prediction.get("base_commit"),
+            formatted_prompt=prediction.get("formatted_prompt"),
+            # Setup phase streams — always populated on every return
+            # path from slice-C onward. Empty string (not None) for
+            # pre-slice-C results so the UI's Setup tab can distinguish
+            # "setup ran with no output" from "pre-migration row".
+            setup_stdout=prediction.get("setup_stdout", "") or "",
+            setup_stderr=prediction.get("setup_stderr", "") or "",
         )
         results.append(result)
 

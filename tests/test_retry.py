@@ -171,6 +171,70 @@ def test_retry_raises_on_exhaustion():
     assert len(sleeps.sleeps) == 5
 
 
+def test_retry_short_circuits_on_cancel_before_next_attempt():
+    """Bug 1: ``is_cancelled`` predicate trips between retries → the
+    loop returns early with the most recent result carrying
+    ``cancelled=True`` instead of sleeping through the back-off."""
+    sleeps = _SleepRecorder()
+    calls = iter([_fake_rl_result(), _fake_rl_result(), _fake_success()])
+
+    cancel_at_call = 2  # flip True after the second rate-limit result
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        return call_count["n"] >= cancel_at_call
+
+    def call_once() -> dict:
+        call_count["n"] += 1
+        return next(calls)
+
+    out = with_rate_limit_retry(
+        call=call_once,
+        detector=ClaudeRateLimitDetector(),
+        policy=RateLimitPolicy(
+            max_retries=5, base_seconds=1.0, max_seconds=10.0, jitter_seconds=0.0
+        ),
+        on_retry=None,
+        interface="claude",
+        sleep=sleeps,
+        rand=lambda lo, hi: 0.0,
+        is_cancelled=is_cancelled,
+    )
+    # Returned the most recent subprocess result with cancelled=True.
+    assert out.get("cancelled") is True
+    # Didn't call the third item — cancel fired after the second sleep.
+    assert call_count["n"] == 2
+    # Sleep happened once between attempts 1 and 2; the cancel-check
+    # after the second attempt's sleep returned before another call.
+    assert len(sleeps.sleeps) >= 1
+
+
+def test_retry_surfaces_subprocess_level_cancel_flag_without_sleeping():
+    """When the subprocess itself was cancelled mid-invocation (the
+    interface's ``_single_invocation`` returns ``cancelled=True``),
+    the retry loop shouldn't classify it as rate-limit or sleep — it
+    should return the cancel result immediately."""
+    sleeps = _SleepRecorder()
+    out = with_rate_limit_retry(
+        call=lambda: {
+            "success": False,
+            "cancelled": True,
+            "stderr": "cancelled by worker",
+            "stdout": "",
+            "returncode": -15,
+        },
+        detector=ClaudeRateLimitDetector(),
+        policy=RateLimitPolicy(max_retries=5, base_seconds=1.0, jitter_seconds=0.0),
+        on_retry=None,
+        interface="claude",
+        sleep=sleeps,
+        rand=lambda lo, hi: 0.0,
+        is_cancelled=lambda: False,
+    )
+    assert out.get("cancelled") is True
+    assert sleeps.sleeps == []
+
+
 def test_retry_surfaces_non_rate_limit_failure():
     """Non-rate-limit failures (e.g., missing dataset) return as-is without
     consuming retry budget — the caller surfaces them unchanged."""

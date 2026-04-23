@@ -152,6 +152,7 @@ def with_rate_limit_retry(
     interface: str,
     sleep: Callable[[float], None] = time.sleep,
     rand: Callable[[float, float], float] = random.uniform,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Invoke ``call`` until it succeeds or rate-limit attempts are exhausted.
 
@@ -159,11 +160,25 @@ def with_rate_limit_retry(
     ``stdout``, ``stderr``, ``returncode``, optionally ``token_usage``).
     Non-rate-limit failures are returned as-is for the caller to surface
     — they don't consume retry budget.
+
+    ``is_cancelled``: optional predicate the worker plumbs through so a
+    long rate-limit back-off doesn't outlast a cancel. Checked before
+    each ``call()`` and chunked during each ``sleep``. When it flips
+    True mid-sleep, the helper returns the most recent ``call()`` result
+    (if any) or a synthetic cancelled dict — the interface's result
+    dict already carries a ``cancelled=True`` flag on the subprocess
+    path, so the caller can detect mid-retry cancel uniformly.
     """
     last: Optional[dict] = None
     result: dict = {}
     for attempt in range(1, policy.max_retries + 2):
+        if is_cancelled is not None and is_cancelled():
+            return _cancelled_result(last)
         result = call()
+        # Subprocess-level cancel fired during this attempt — no point
+        # sleeping + retrying; the worker wants to shut down.
+        if result.get("cancelled"):
+            return result
         if result.get("success"):
             return result
         hit = detector.classify(result)
@@ -185,6 +200,44 @@ def with_rate_limit_retry(
                     detail=hit.detail,
                 )
             )
-        sleep(wait)
+        _cancellable_sleep(wait, sleep=sleep, is_cancelled=is_cancelled)
+        if is_cancelled is not None and is_cancelled():
+            return _cancelled_result(result)
         last = result
     return last if last is not None else result
+
+
+_SLEEP_CHUNK_S = 1.0
+
+
+def _cancellable_sleep(
+    total: float,
+    *,
+    sleep: Callable[[float], None],
+    is_cancelled: Optional[Callable[[], bool]],
+) -> None:
+    """Sleep ``total`` seconds in ``_SLEEP_CHUNK_S`` chunks, checking
+    ``is_cancelled`` between each chunk so a cancel has at most one
+    chunk of latency. Plain ``sleep(total)`` when no predicate is
+    supplied — identical to pre-Bug-1 behavior.
+    """
+    if is_cancelled is None:
+        sleep(total)
+        return
+    remaining = max(0.0, total)
+    while remaining > 0.0:
+        if is_cancelled():
+            return
+        step = min(_SLEEP_CHUNK_S, remaining)
+        sleep(step)
+        remaining -= step
+
+
+def _cancelled_result(prior: Optional[dict]) -> dict:
+    """Build a dict in the shape the interfaces produce so callers can
+    uniformly detect cancellation via ``result.get("cancelled")``.
+    Prefers a prior subprocess result when one exists (so the stderr
+    tail + token usage aren't silently dropped)."""
+    base = dict(prior) if prior else {"success": False, "stdout": "", "stderr": ""}
+    base["cancelled"] = True
+    return base
