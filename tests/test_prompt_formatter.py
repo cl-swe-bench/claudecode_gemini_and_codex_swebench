@@ -208,3 +208,84 @@ def test_format_issue_issue_title_is_first_line_of_problem_statement_only():
     # (template: ``Issue: {issue_title}``), not a header from the
     # enriched body.
     assert "Issue: One-line title" in prompt
+
+
+# -------------------- mcp_prompt_nudge variant --------------------
+
+
+def _basic_instance() -> dict:
+    return {
+        "instance_id": "inst_1",
+        "repo": "acme/widget",
+        "base_commit": "abc123",
+        "problem_statement": "Fix the bug\n\nDetails here.",
+    }
+
+
+def test_default_template_unchanged_when_nudge_off():
+    """Regression guard: nudge=False preserves the byte-shape of the
+    cc-46-full-run-regen baseline. Any drift here breaks comparability
+    with non-MCP runs.
+    """
+    formatter = PromptFormatter()
+    prompt = formatter.format_issue(_basic_instance())
+    # Sentinel substrings unique to the default 5-step template.
+    assert "1. Understand the issue by carefully reading the description" in prompt
+    assert "2. Search the codebase to find relevant files using grep, find, or other search tools" in prompt
+    # The nudged variant's preamble must NOT appear.
+    assert "Codebase context tools" not in prompt
+    assert "mcp__code-lexica" not in prompt
+
+
+def test_nudge_template_inserts_codebase_context_block():
+    formatter = PromptFormatter(
+        mcp_prompt_nudge=True,
+        repo_identifier="https://github.com/acme/widget.git",
+    )
+    prompt = formatter.format_issue(_basic_instance())
+    # Block header + both tool names land verbatim.
+    assert "Codebase context tools (call these first; subagents have access too):" in prompt
+    assert "mcp__code-lexica__get_codebase_context" in prompt
+    assert "mcp__code-lexica__get_implementation_guide" in prompt
+    # 7-step task list — the new MCP-first step + the get_implementation_guide step.
+    assert "2. Always use mcp__code-lexica__get_codebase_context to fetch context" in prompt
+    assert "5. Call mcp__code-lexica__get_implementation_guide if your fix" in prompt
+    assert "7. Ensure your fix doesn't break existing functionality" in prompt
+
+
+def test_nudge_template_substitutes_repo_identifier():
+    formatter = PromptFormatter(
+        mcp_prompt_nudge=True,
+        repo_identifier="https://github.com/foo/bar.git",
+    )
+    prompt = formatter.format_issue(_basic_instance())
+    assert 'repoIdentifier="https://github.com/foo/bar.git"' in prompt
+    # The {repo_identifier} placeholder is fully substituted (no curly braces).
+    assert "{repo_identifier}" not in prompt
+
+
+def test_nudge_template_handles_missing_repo_identifier():
+    """No-identifier path renders an empty string in the placeholder
+    rather than raising. The agent can still call ``git remote get-url
+    origin`` itself when this happens — but the harness should always
+    pass an identifier; this is a defensive fallback."""
+    formatter = PromptFormatter(mcp_prompt_nudge=True)
+    prompt = formatter.format_issue(_basic_instance())
+    assert 'repoIdentifier=""' in prompt
+    assert "{repo_identifier}" not in prompt
+
+
+def test_external_template_path_takes_precedence_over_nudge(tmp_path):
+    """When both ``prompt_template_path`` and ``mcp_prompt_nudge=True``
+    are set, the external file wins. This keeps the Phase-7 codex/gemini
+    custom-template path open without nudge interference."""
+    custom = tmp_path / "custom.tmpl"
+    custom.write_text("CUSTOM PROMPT for {repo_name}: {issue_title}")
+    formatter = PromptFormatter(
+        prompt_template_path=str(custom),
+        mcp_prompt_nudge=True,
+    )
+    prompt = formatter.format_issue(_basic_instance())
+    assert prompt.startswith("CUSTOM PROMPT for acme/widget")
+    # Nudge content does NOT appear when external template is used.
+    assert "mcp__code-lexica" not in prompt

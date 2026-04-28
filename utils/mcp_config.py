@@ -184,3 +184,103 @@ class McpConfigManager:
         """Remove .mcp.json from task directory if present."""
         mcp_path = Path(task_dir) / ".mcp.json"
         mcp_path.unlink(missing_ok=True)
+
+
+# ---------- CLAUDE.md injection ----------------------------------------------
+#
+# Customers using Code Lexica MCP put a ``## Code Lexica MCP`` section in
+# their repo's CLAUDE.md to nudge Claude toward the MCP tools at the right
+# moments. cl-benchmark mirrors that deployment shape by injecting the same
+# section into the cloned-instance repo before invoking the agent — so MCP
+# runs see what real customer environments see. Spec:
+# cl-benchmark/docs/mcp-priming-spec.md.
+#
+# The section is wrapped in HTML-comment sentinels so re-runs replace
+# in-place rather than duplicating, and existing customer CLAUDE.md
+# content (if the upstream repo already ships one) is preserved verbatim.
+
+_CLAUDE_MD_SENTINEL_START = "<!-- code-lexica:start -->"
+_CLAUDE_MD_SENTINEL_END = "<!-- code-lexica:end -->"
+
+_CLAUDE_MD_TEMPLATE_PATH = (
+    Path(__file__).parent.parent / "configs" / "code_lexica_claude_md_template.md"
+)
+
+
+def _read_claude_md_template() -> str:
+    """Read the canonical Code Lexica CLAUDE.md template from
+    ``configs/code_lexica_claude_md_template.md``. Single source of truth
+    shared with the Phase-7 customer-onboarding tooling.
+    """
+    return _CLAUDE_MD_TEMPLATE_PATH.read_text()
+
+
+def _render_claude_md_section(repo_identifier: str) -> str:
+    """Substitute ``{repo_identifier}`` into the template. The result is
+    a complete, sentinel-wrapped section ready to drop into a CLAUDE.md.
+    """
+    template = _read_claude_md_template()
+    return template.replace("{repo_identifier}", repo_identifier).rstrip() + "\n"
+
+
+def _replace_section(existing: str, new_section: str) -> str:
+    """Replace the bracketed ``<!-- code-lexica:start -->`` …
+    ``<!-- code-lexica:end -->`` region in ``existing`` with ``new_section``.
+    """
+    start_idx = existing.find(_CLAUDE_MD_SENTINEL_START)
+    end_idx = existing.find(_CLAUDE_MD_SENTINEL_END)
+    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        return existing  # caller should detect via ``has_section`` first
+    end_with_marker = end_idx + len(_CLAUDE_MD_SENTINEL_END)
+    # Eat one trailing newline if present so we don't accumulate blank
+    # lines on repeated replace cycles.
+    if end_with_marker < len(existing) and existing[end_with_marker] == "\n":
+        end_with_marker += 1
+    return existing[:start_idx] + new_section + existing[end_with_marker:]
+
+
+def inject_claude_md_section(task_dir: str, repo_identifier: str) -> Path:
+    """Write or update the Code Lexica section in ``<task_dir>/CLAUDE.md``.
+
+    Behavior:
+      * No CLAUDE.md → write fresh, wrapped in sentinels.
+      * CLAUDE.md exists with our sentinels → replace the bracketed
+        section in-place.
+      * CLAUDE.md exists without our sentinels → append our section to
+        the end with a leading blank line, preserving upstream content.
+
+    Returns the path written. Idempotent across re-runs.
+    """
+    section = _render_claude_md_section(repo_identifier)
+    claude_md = Path(task_dir) / "CLAUDE.md"
+    if not claude_md.exists():
+        claude_md.write_text(section)
+        return claude_md
+    existing = claude_md.read_text()
+    if _CLAUDE_MD_SENTINEL_START in existing and _CLAUDE_MD_SENTINEL_END in existing:
+        claude_md.write_text(_replace_section(existing, section))
+    else:
+        sep = "" if existing.endswith("\n") else "\n"
+        claude_md.write_text(existing + sep + "\n" + section)
+    return claude_md
+
+
+def remove_claude_md_section(task_dir: str) -> None:
+    """Strip the Code Lexica section from ``<task_dir>/CLAUDE.md`` if
+    present. If our section is the only content, the file is removed
+    entirely (avoids leaving a single trailing newline as the file
+    body); otherwise upstream content is preserved.
+
+    No-op when the file or section doesn't exist.
+    """
+    claude_md = Path(task_dir) / "CLAUDE.md"
+    if not claude_md.exists():
+        return
+    existing = claude_md.read_text()
+    if _CLAUDE_MD_SENTINEL_START not in existing or _CLAUDE_MD_SENTINEL_END not in existing:
+        return
+    stripped = _replace_section(existing, "").rstrip()
+    if stripped:
+        claude_md.write_text(stripped + "\n")
+    else:
+        claude_md.unlink()

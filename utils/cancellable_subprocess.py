@@ -20,8 +20,9 @@ import contextlib
 import os
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import IO, Callable, List, Optional
 
 # ``contextlib.suppress`` alias used as a short-name noise swallower for
 # "drain whatever bytes exist, skip if the stream is weird". Avoids
@@ -102,15 +103,21 @@ def run_with_cancel(
             grace_s=grace_s,
         )
     except subprocess.TimeoutExpired:
-        # Kill the group so grandchildren die too — same reasoning as
-        # start_new_session above. Drain stdio directly rather than
-        # re-calling ``communicate`` — stdin is already closed in the
-        # cancel-path branch, and ``communicate`` errors when it tries
-        # to re-flush a closed pipe.
-        _kill_process_group(proc, sig=signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=grace_s)
-        stdout, stderr = _drain_stdio(proc)
+        # Cancel-path's ``_wait_cancellable`` already killed the group +
+        # joined the drain threads + stashed partial stdout/stderr on
+        # the proc before raising. Reading from ``proc.stdout`` here
+        # would race the drain threads (now joined) and yield empty —
+        # use the stash instead. No-cancel path has no drain threads
+        # in play, so it falls through to ``_drain_stdio`` for the
+        # post-kill read.
+        if getattr(proc, "_cl_partial_stdout", None) is not None:
+            stdout = proc._cl_partial_stdout  # type: ignore[attr-defined]
+            stderr = proc._cl_partial_stderr  # type: ignore[attr-defined]
+        else:
+            _kill_process_group(proc, sig=signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=grace_s)
+            stdout, stderr = _drain_stdio(proc)
         return CancellableResult(
             returncode=-1,
             stdout=stdout,
@@ -161,35 +168,66 @@ def _wait_cancellable(
 
     # Cancel path: push stdin up front, close it, then poll ``wait``
     # instead of ``communicate`` — ``communicate`` tries to re-flush
-    # stdin and errors on our already-closed pipe. After the process
-    # exits (for any reason: natural, SIGTERM, SIGKILL), drain
-    # stdout/stderr directly via ``read()``. Fine for CLI prompts
-    # under ~1 MB — well below any pipe buffer.
+    # stdin and errors on our already-closed pipe.
+    #
+    # Bug 2 (2026-04-28): we MUST drain stdout + stderr concurrently
+    # with the wait loop. macOS pipe buffers are 64 KiB; ``proc.wait``
+    # alone doesn't read from the pipes, so a child writing more than
+    # 64 KiB to stdout (e.g. ``claude --output-format stream-json`` for
+    # any non-trivial run) blocks on its next write, never reaches the
+    # final ``result`` event, and eventually exits with its stdout
+    # buffered at exactly 64 KiB. Draining the pipes in background
+    # reader threads lets the child stream the full transcript through
+    # — same mechanism ``proc.communicate`` uses internally for the
+    # no-cancel path.
     if proc.stdin is not None:
         try:
             proc.stdin.write(input_text)
         finally:
             proc.stdin.close()
 
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    stdout_thread = (
+        _start_drain_thread(proc.stdout, stdout_chunks) if proc.stdout is not None else None
+    )
+    stderr_thread = (
+        _start_drain_thread(proc.stderr, stderr_chunks) if proc.stderr is not None else None
+    )
+
     elapsed = 0.0
     while elapsed < timeout_s:
         if is_cancelled():
             _signal_cancel(proc, grace_s=grace_s)
             setattr(proc, "_cl_cancelled", True)
-            return _drain_stdio(proc)
+            return _join_drain_threads(stdout_thread, stderr_thread, stdout_chunks, stderr_chunks)
         try:
             proc.wait(timeout=_POLL_INTERVAL_S)
-            return _drain_stdio(proc)
+            return _join_drain_threads(stdout_thread, stderr_thread, stdout_chunks, stderr_chunks)
         except subprocess.TimeoutExpired:
             elapsed += _POLL_INTERVAL_S
             continue
+    # Outer timeout — kill, join drain threads (they hit EOF on the
+    # killed pipes), stash the partial bytes on the proc so the
+    # caller's ``except TimeoutExpired`` block can surface them
+    # without re-reading and racing the drain threads.
+    _kill_process_group(proc, sig=signal.SIGKILL)
+    with _suppress_timeout():
+        proc.wait(timeout=grace_s)
+    partial_out, partial_err = _join_drain_threads(
+        stdout_thread, stderr_thread, stdout_chunks, stderr_chunks
+    )
+    setattr(proc, "_cl_partial_stdout", partial_out)
+    setattr(proc, "_cl_partial_stderr", partial_err)
     raise subprocess.TimeoutExpired(proc.args, timeout_s)
 
 
 def _drain_stdio(proc: subprocess.Popen) -> tuple[str, str]:
     """Read whatever stdout/stderr the process wrote before exiting.
     Called only after ``wait`` returned (or we killed the group), so
-    the streams are EOF and won't block."""
+    the streams are EOF and won't block. Used by the timeout-expired
+    branch in ``run_with_cancel`` — the cancel-path uses background
+    drain threads instead (see ``_start_drain_thread``)."""
     stdout = ""
     stderr = ""
     if proc.stdout is not None:
@@ -199,6 +237,51 @@ def _drain_stdio(proc: subprocess.Popen) -> tuple[str, str]:
         with contextlib_suppress(Exception):
             stderr = proc.stderr.read() or ""
     return stdout, stderr
+
+
+def _start_drain_thread(stream: IO[str], chunks: List[str]) -> threading.Thread:
+    """Spawn a daemon thread that reads ``stream`` to EOF and appends
+    each ``read()`` result to ``chunks``. Mirrors what
+    ``subprocess.communicate`` does internally so the child doesn't
+    block on a full pipe buffer (64 KiB on macOS) while we poll
+    ``is_cancelled`` in the main thread."""
+
+    def _drain() -> None:
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                chunks.append(chunk)
+        except (OSError, ValueError):
+            # Pipe closed mid-read (process killed, signal-induced
+            # broken pipe). The wait/cancel path handles termination;
+            # here we just stop draining and surface what we have.
+            return
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    return t
+
+
+def _join_drain_threads(
+    stdout_thread: Optional[threading.Thread],
+    stderr_thread: Optional[threading.Thread],
+    stdout_chunks: List[str],
+    stderr_chunks: List[str],
+    *,
+    join_timeout_s: float = 5.0,
+) -> tuple[str, str]:
+    """Wait for the drain threads to finish (process has exited / been
+    killed → streams hit EOF → threads return), then assemble the
+    accumulated chunks. Bounded join to avoid hanging on a stuck
+    reader thread; callers tolerate empty/partial output on degraded
+    paths."""
+    if stdout_thread is not None:
+        stdout_thread.join(timeout=join_timeout_s)
+    if stderr_thread is not None:
+        stderr_thread.join(timeout=join_timeout_s)
+    return "".join(stdout_chunks), "".join(stderr_chunks)
 
 
 def _signal_cancel(proc: subprocess.Popen, *, grace_s: float) -> None:
