@@ -25,10 +25,44 @@ from utils.gemini_interface import GeminiCodeInterface
 from utils.prompt_formatter import PromptFormatter
 from utils.patch_extractor import PatchExtractor
 from utils.model_registry import get_model_name
-from utils.mcp_config import McpConfigManager
+from utils.mcp_config import (
+    McpConfigManager,
+    inject_claude_md_section,
+    remove_claude_md_section,
+)
 
 
 DEFAULT_BACKEND = os.environ.get("CODE_SWE_BACKEND", "claude")
+
+
+def _resolve_repo_identifier(repo_path: str, fallback_repo: str) -> str:
+    """Resolve the cloned repo's git remote URL for use as the Code
+    Lexica ``repoIdentifier``. Used for both the nudged prompt template
+    and the injected CLAUDE.md section.
+
+    Returns the literal ``git remote get-url origin`` output when
+    available; falls back to ``https://github.com/{repo}.git`` if the
+    subprocess fails (e.g. origin unset, repo_path missing). The
+    fallback shape matches what GitHub clones use, so it's still a
+    valid repoIdentifier the MCP server can resolve.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            if url:
+                return url
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if fallback_repo:
+        return f"https://github.com/{fallback_repo}.git"
+    return ""
 
 
 class CodeSWEAgent:
@@ -44,7 +78,9 @@ class CodeSWEAgent:
                  subprocess_timeout_s: int = 900,
                  env_overrides: Optional[Dict[str, str]] = None,
                  on_rate_limit_retry: Optional[Callable[[Any], None]] = None,
-                 is_cancelled: Optional[Callable[[], bool]] = None):
+                 is_cancelled: Optional[Callable[[], bool]] = None,
+                 output_format: str = "json",
+                 mcp_prompt_nudge: bool = False):
         # env_overrides + on_rate_limit_retry are Phase 4 additions. The
         # worker plumbs per-shard env + a structlog-emitting callback; the
         # standalone CLI leaves both at None and the behaviour is
@@ -70,14 +106,30 @@ class CodeSWEAgent:
             )
         else:
             self.backend = "claude"
+            # ``output_format`` is claude-only for now — codex/gemini
+            # interfaces don't accept it. cl-benchmark only sets it
+            # to ``stream-json`` for ``capture_full_transcript=True``
+            # runs against the claude harness; codex/gemini variants
+            # would need their own equivalent in a future slice.
             self.interface = ClaudeCodeInterface(
                 timeout_s=subprocess_timeout_s,
                 env_overrides=env_overrides,
                 on_rate_limit_retry=on_rate_limit_retry,
                 is_cancelled=is_cancelled,
+                output_format=output_format,
             )
 
-        self.prompt_formatter = PromptFormatter(prompt_template)
+        # ``mcp_prompt_nudge`` only takes effect on the claude backend
+        # for now — codex/gemini get the default template until their
+        # nudge templates land (Phase-7 deferral, see
+        # docs/mcp-priming-spec.md). ``repo_identifier`` is set
+        # per-instance in ``process_instance`` once the cloned repo's
+        # ``git remote get-url origin`` resolves.
+        self.mcp_prompt_nudge = mcp_prompt_nudge and self.backend == "claude"
+        self.prompt_formatter = PromptFormatter(
+            prompt_template_path=prompt_template,
+            mcp_prompt_nudge=self.mcp_prompt_nudge,
+        )
         self.patch_extractor = PatchExtractor()
         self.base_dir = Path.cwd()
         self.results_dir = self.base_dir / "results"
@@ -308,11 +360,20 @@ class CodeSWEAgent:
             }
 
         try:
-            # Inject or remove MCP config before running the agent
-            if self.mcp_enabled and self.mcp_manager:
-                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
-            else:
-                McpConfigManager.remove_mcp_json(repo_path)
+            os.chdir(repo_path)
+            subprocess.run(["git", "add", "-A"], capture_output=True)
+            subprocess.run(["git", "stash"], capture_output=True)
+
+            # Resolve the repo's git remote URL post-stash for use as the
+            # Code Lexica MCP ``repoIdentifier``. Substituted into the
+            # nudged prompt template + the CLAUDE.md section, and saves
+            # the agent a discovery round-trip. Falls back to the inferred
+            # GitHub URL if origin isn't set (defensive — SWE-bench
+            # clones always have origin).
+            repo_identifier = _resolve_repo_identifier(
+                repo_path, fallback_repo=instance.get("repo", "")
+            )
+            self.prompt_formatter.repo_identifier = repo_identifier
 
             prompt = self.prompt_formatter.format_for_cli(instance)
             # Capture the prompt bytes we actually sent. The formatter
@@ -320,9 +381,21 @@ class CodeSWEAgent:
             # the CLI reads from stdin.
             task_context["formatted_prompt"] = prompt
 
-            os.chdir(repo_path)
-            subprocess.run(["git", "add", "-A"], capture_output=True)
-            subprocess.run(["git", "stash"], capture_output=True)
+            # Inject ``.mcp.json`` and ``CLAUDE.md`` AFTER the
+            # ``git add -A`` + ``git stash`` cleanup. The stash hides
+            # any retry-leftover working-tree modifications, and ``-A``
+            # would have staged both files too — writing them before
+            # the stash silently swept them away, which is the same
+            # bug pattern that previously caused ``mcp_servers: []``
+            # in transcripts. Writing post-stash keeps both files on
+            # disk + untracked for the duration of the agent run.
+            # Spec: cl-benchmark/docs/mcp-priming-spec.md.
+            if self.mcp_enabled and self.mcp_manager:
+                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
+                inject_claude_md_section(repo_path, repo_identifier)
+            else:
+                McpConfigManager.remove_mcp_json(repo_path)
+                remove_claude_md_section(repo_path)
 
             model_info = f" with model {self.model_alias}" if self.model else ""
             print(f"Running {self.backend.title()} Code{model_info}...")
@@ -557,6 +630,8 @@ def run_shard(
     env_overrides: Optional[Dict[str, str]] = None,
     rate_limit_callback: Optional[Callable[[Any], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    output_format: str = "json",
+    mcp_prompt_nudge: bool = False,
 ) -> List[Any]:
     """Shardable library entry point used by the cl-benchmark worker.
 
@@ -608,6 +683,8 @@ def run_shard(
         env_overrides=env_overrides,
         on_rate_limit_retry=rate_limit_callback,
         is_cancelled=is_cancelled,
+        output_format=output_format,
+        mcp_prompt_nudge=mcp_prompt_nudge,
     )
 
     dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")

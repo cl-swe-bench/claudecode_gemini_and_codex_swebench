@@ -124,3 +124,38 @@ def test_non_cancel_exit_codes_propagate(returncode):
     assert result.returncode == returncode
     assert not result.cancelled
     assert not result.timed_out
+
+
+def test_cancel_path_streams_more_than_pipe_buffer():
+    """Bug 2 (2026-04-28) regression guard. Cancel-path callers (worker
+    runs are always cancel-path) must capture stdout > 64 KiB — the
+    macOS pipe-buffer cap. Without concurrent draining, ``proc.wait``
+    blocks the child once the buffer fills, the run completes with
+    exactly 65 536 bytes, and the final ``result`` event (with token
+    counts + cost) is lost. We emit ~256 KiB of stdout to verify the
+    drain-thread fix.
+    """
+
+    # 256 KiB of "x\n" lines + a sentinel last line. If we see the
+    # sentinel, draining worked: the child wasn't blocked at 64 KiB.
+    payload_lines = 16384
+    script = (
+        "for i in $(seq 1 {n}); do printf 'xxxxxxxxxxxxxxxx\\n'; done; "
+        "echo '__SENTINEL_LAST_LINE__'"
+    ).format(n=payload_lines)
+
+    result = run_with_cancel(
+        ["bash", "-c", script],
+        input="",
+        cwd=os.getcwd(),
+        env=None,
+        timeout_s=15,
+        is_cancelled=lambda: False,
+    )
+    assert result.returncode == 0
+    assert not result.cancelled
+    assert not result.timed_out
+    # Total output is well above 64 KiB; the sentinel is the very last
+    # line and only renders if the parent drained the pipe throughout.
+    assert len(result.stdout) > 200 * 1024
+    assert "__SENTINEL_LAST_LINE__" in result.stdout

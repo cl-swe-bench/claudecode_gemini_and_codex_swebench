@@ -41,11 +41,32 @@ def _concat_problem_statement(
 
 class PromptFormatter:
     """Format SWE-bench issues into prompts for Claude Code."""
-    
-    def __init__(self, prompt_template_path: Optional[str] = None):
+
+    def __init__(
+        self,
+        prompt_template_path: Optional[str] = None,
+        mcp_prompt_nudge: bool = False,
+        repo_identifier: Optional[str] = None,
+    ):
+        """
+        Args:
+            prompt_template_path: Optional external template file. Overrides
+                the inline default + nudge templates when set.
+            mcp_prompt_nudge: When True, swap the inline default for the
+                MCP-aware variant (Codebase context tools block + 7-step
+                task list). cl-benchmark's run-form toggle drives this; the
+                external template path takes precedence if both are set.
+                Spec: cl-benchmark/docs/mcp-priming-spec.md.
+            repo_identifier: Git remote URL (e.g.
+                ``https://github.com/owner/repo.git``) substituted into the
+                nudged template's ``{repo_identifier}`` placeholder. Inert
+                for the default template, which doesn't reference MCP.
+        """
         self.prompt_template_path = prompt_template_path
+        self.mcp_prompt_nudge = mcp_prompt_nudge
+        self.repo_identifier = repo_identifier
         self.base_template = self._load_base_template()
-        
+
     def _load_base_template(self) -> str:
         """Load the base prompt template."""
         if self.prompt_template_path:
@@ -54,7 +75,10 @@ class PromptFormatter:
                     return f.read()
             except FileNotFoundError:
                 pass
-        
+
+        if self.mcp_prompt_nudge:
+            return self._mcp_nudge_template()
+
         # Default template.
         #
         # Aligned with SWE-bench_Pro-os's `tool_use.yaml` instance
@@ -96,7 +120,56 @@ Important notes:
 
 Base directory: {base_path}
 """
-    
+
+    def _mcp_nudge_template(self) -> str:
+        """MCP-aware variant of the default template — emitted when the
+        caller passes ``mcp_prompt_nudge=True``. Adds a "Codebase context
+        tools" block before the task list and grows the task list from 5
+        to 7 steps to put MCP usage ahead of native search.
+
+        ``{repo_identifier}`` is substituted at format time. cl-benchmark
+        threads the resolved git remote URL down through ``run_shard``;
+        callers without an identifier get an empty string and the prompt
+        still parses (the agent can still call ``git remote get-url
+        origin`` itself). Spec:
+        cl-benchmark/docs/mcp-priming-spec.md.
+        """
+        return """You have access to a repository with a software issue that needs to be fixed.
+
+Repository: {repo_name}
+Issue: {issue_title}
+
+Issue Description:
+{issue_description}
+
+I've already taken care of all changes to any of the test files described in the issue description. This means you DON'T have to modify the testing logic or any of the tests in any way. Your task is to make the minimal changes to non-test files in the repository to satisfy the issue description.
+
+Codebase context tools (call these first; subagents have access too):
+  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
+    Call BEFORE any grep/find/Read or before delegating to a subagent.
+  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.
+    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.
+
+For all Code Lexica calls, pass repoIdentifier="{repo_identifier}".
+
+Your task:
+1. Understand the issue by carefully reading the description
+2. Always use mcp__code-lexica__get_codebase_context to fetch context on the codebase FIRST – before beginning or spinning up subagents.
+3. Search the codebase to find relevant files using grep, find, or other search tools
+4. Analyze the code to understand the root cause
+5. Call mcp__code-lexica__get_implementation_guide if your fix will touch business logic, endpoints, models, or routes. Do this BEFORE generating a fix.
+6. Generate a fix that resolves the issue.
+7. Ensure your fix doesn't break existing functionality
+
+Important notes:
+- Leverage the context from the codebase context tools provided throughout your process.
+- Focus on making minimal, targeted changes
+- Consider edge cases and potential side effects
+- Output clear file edits showing exactly what needs to be changed
+
+Base directory: {base_path}
+"""
+
     def format_issue(self, instance: Dict) -> str:
         """Format a SWE-bench instance into a prompt for Claude Code."""
         # Extract key information from the instance
@@ -130,6 +203,7 @@ Base directory: {base_path}
             base_path=str(base_path),
             instance_id=instance_id,
             base_commit=base_commit,
+            repo_identifier=self.repo_identifier or "",
         )
 
         # Add any hints if available
