@@ -1,7 +1,7 @@
 import os
 import json
 import subprocess
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 from dotenv import load_dotenv
 
 from utils.cancellable_subprocess import run_with_cancel
@@ -15,6 +15,17 @@ from utils.retry import (
 load_dotenv()
 
 
+# Claude Code's ``-p --output-format`` knob. ``json`` emits a single
+# summary blob (default; baseline-comparable behavior). ``stream-json``
+# emits NDJSON with one event per turn including ``tool_use`` /
+# ``tool_result`` blocks — used by cl-benchmark when the run has
+# ``capture_full_transcript=True`` for diagnostic visibility into MCP
+# tool calls. Both formats emit a final ``result`` event with the same
+# token/cost totals; the cl-benchmark cost rollup parses that final
+# event in either case so token accounting is identical.
+OutputFormat = Literal["json", "stream-json"]
+
+
 class ClaudeCodeInterface:
     """Interface for interacting with Claude Code CLI."""
 
@@ -25,6 +36,7 @@ class ClaudeCodeInterface:
         retry_policy: Optional[RateLimitPolicy] = None,
         on_rate_limit_retry: Optional[Callable[[RateLimitEvent], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        output_format: OutputFormat = "json",
     ):
         """Ensure the Claude CLI is available on the system.
 
@@ -48,12 +60,25 @@ class ClaudeCodeInterface:
                 cancelled shard running for many minutes while the
                 worker's between-instance cancel check waits for the
                 current invocation to finish on its own.
+            output_format: ``json`` (default; baseline) emits a single
+                summary blob. ``stream-json`` emits NDJSON of every
+                turn including ``tool_use`` / ``tool_result`` blocks —
+                cl-benchmark workers pass this when the run has
+                ``capture_full_transcript=True`` for diagnostic
+                visibility. Both formats share an identical final
+                ``result`` event so token + cost extraction is
+                format-invariant.
         """
+        if output_format not in ("json", "stream-json"):
+            raise ValueError(
+                f"output_format must be 'json' or 'stream-json', got {output_format!r}"
+            )
         self.timeout_s = timeout_s
         self.env_overrides: Dict[str, str] = dict(env_overrides) if env_overrides else {}
         self.retry_policy = retry_policy or RateLimitPolicy()
         self.on_rate_limit_retry = on_rate_limit_retry
         self.is_cancelled = is_cancelled
+        self.output_format = output_format
         self._detector = ClaudeRateLimitDetector()
         try:
             result = subprocess.run([
@@ -89,9 +114,37 @@ class ClaudeCodeInterface:
         self, prompt: str, cwd: str, model: Optional[str]
     ) -> Dict[str, Any]:
         """One ``claude -p`` subprocess call, wrapped by the retry loop."""
-        # Build command with optional model parameter. Use -p (print
-        # mode) with --output-format json for structured output.
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        # ``--output-format`` defaults to ``json`` (single summary blob,
+        # baseline behavior). ``stream-json`` emits NDJSON with every
+        # turn's tool_use + tool_result content; cl-benchmark callers
+        # pass it when the run has ``capture_full_transcript=True``.
+        # The CLI rejects ``-p --output-format=stream-json`` without
+        # ``--verbose`` ("requires --verbose"), so add it in tandem.
+        cmd = [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            self.output_format,
+        ]
+        if self.output_format == "stream-json":
+            cmd.append("--verbose")
+        # MCP wiring. ``code_swe_agent.process_instance`` writes a
+        # per-instance ``.mcp.json`` into ``cwd`` when MCP is enabled
+        # (per-repo Code Lexica token). Claude Code ignores
+        # project-scoped ``.mcp.json`` files unless the user has trusted
+        # the workspace interactively — and ``--dangerously-skip-permissions``
+        # does NOT cover that trust prompt. cl-benchmark runs in a fresh
+        # tempdir + isolated ``HOME`` per shard, so no trust ever
+        # persists and the CLI silently boots with ``mcp_servers: []``.
+        # Passing ``--mcp-config`` explicitly bypasses the trust step
+        # (the CLI treats the flag value as user-supplied + auto-trusted),
+        # and ``--strict-mcp-config`` ensures we don't accidentally also
+        # load any user-scoped MCP config that drifted into ``HOME``.
+        # No flag → byte-identical baseline behavior for non-MCP runs.
+        mcp_path = os.path.join(cwd, ".mcp.json")
+        if os.path.isfile(mcp_path):
+            cmd.extend(["--mcp-config", mcp_path, "--strict-mcp-config"])
         if model:
             cmd.extend(["--model", model])
 
@@ -146,8 +199,9 @@ class ClaudeCodeInterface:
                 "cancelled": True,
             }
 
-        # Parse JSON output for token usage and metadata
-        # Claude Code -p --output-format json returns:
+        # Parse output for token usage and metadata. Both ``json`` and
+        # ``stream-json`` formats share the same final ``result`` event
+        # shape:
         # {
         #   "result": "...", "num_turns": N, "duration_ms": N,
         #   "duration_api_ms": N, "is_error": bool, "session_id": "...",
@@ -155,33 +209,35 @@ class ClaudeCodeInterface:
         #   "usage": { "input_tokens": N, "output_tokens": N,
         #              "cache_creation_input_tokens": N, "cache_read_input_tokens": N }
         # }
+        # ``json`` emits this as the single stdout blob. ``stream-json``
+        # emits it as the final NDJSON event with ``type: "result"``;
+        # ``_extract_result_event`` walks the NDJSON to find it. Either
+        # way, downstream parsing is identical so cost rollups don't
+        # drift between formats.
         token_usage = {}
         if result.stdout:
-            try:
-                output_data = json.loads(result.stdout)
-                if isinstance(output_data, dict):
-                    usage = output_data.get("usage") or {}
-                    input_tokens = usage.get("input_tokens", 0)
-                    output_tokens = usage.get("output_tokens", 0)
-                    token_usage = {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                        "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
-                        "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
-                    }
-                    if output_data.get("total_cost_usd") is not None:
-                        token_usage["cost_usd"] = output_data["total_cost_usd"]
-                    if output_data.get("num_turns") is not None:
-                        token_usage["num_turns"] = output_data["num_turns"]
-                    if output_data.get("duration_ms") is not None:
-                        token_usage["duration_ms"] = output_data["duration_ms"]
-                    if output_data.get("duration_api_ms") is not None:
-                        token_usage["duration_api_ms"] = output_data["duration_api_ms"]
-                    if output_data.get("session_id") is not None:
-                        token_usage["session_id"] = output_data["session_id"]
-            except (json.JSONDecodeError, KeyError, TypeError):
-                pass  # Fall back to no token tracking
+            output_data = self._extract_result_event(result.stdout)
+            if isinstance(output_data, dict):
+                usage = output_data.get("usage") or {}
+                input_tokens = usage.get("input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
+                token_usage = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
+                    "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
+                }
+                if output_data.get("total_cost_usd") is not None:
+                    token_usage["cost_usd"] = output_data["total_cost_usd"]
+                if output_data.get("num_turns") is not None:
+                    token_usage["num_turns"] = output_data["num_turns"]
+                if output_data.get("duration_ms") is not None:
+                    token_usage["duration_ms"] = output_data["duration_ms"]
+                if output_data.get("duration_api_ms") is not None:
+                    token_usage["duration_api_ms"] = output_data["duration_api_ms"]
+                if output_data.get("session_id") is not None:
+                    token_usage["session_id"] = output_data["session_id"]
 
         return {
             "success": result.returncode == 0,
@@ -190,6 +246,42 @@ class ClaudeCodeInterface:
             "returncode": result.returncode,
             "token_usage": token_usage,
         }
+
+    def _extract_result_event(self, stdout: str) -> Dict[str, Any]:
+        """Pull the final ``result`` event out of ``stdout``.
+
+        ``json`` mode: stdout is a single JSON blob — parse + return as-is.
+        ``stream-json`` mode: stdout is NDJSON of many events — find the
+        last event with ``type == "result"`` and return it.
+
+        Empty / unparseable input returns ``{}`` (callers fall back to no
+        token tracking, mirroring the prior json-only error path). This
+        is deliberate — a malformed transcript shouldn't kill the patch
+        pipeline; the patch is extracted via ``git diff`` independently.
+        """
+        if self.output_format == "json":
+            try:
+                data = json.loads(stdout)
+                return data if isinstance(data, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+
+        # stream-json: walk NDJSON for the final ``type=result`` event.
+        last_result: Dict[str, Any] = {}
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # Malformed line in the middle of the stream — skip it
+                # and keep walking. A single bad line shouldn't kill
+                # the rest.
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                last_result = event
+        return last_result
 
     def extract_file_changes(self, response: str) -> List[Dict[str, str]]:
         """Extract file changes from Claude's response."""

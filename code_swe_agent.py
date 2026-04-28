@@ -44,7 +44,8 @@ class CodeSWEAgent:
                  subprocess_timeout_s: int = 900,
                  env_overrides: Optional[Dict[str, str]] = None,
                  on_rate_limit_retry: Optional[Callable[[Any], None]] = None,
-                 is_cancelled: Optional[Callable[[], bool]] = None):
+                 is_cancelled: Optional[Callable[[], bool]] = None,
+                 output_format: str = "json"):
         # env_overrides + on_rate_limit_retry are Phase 4 additions. The
         # worker plumbs per-shard env + a structlog-emitting callback; the
         # standalone CLI leaves both at None and the behaviour is
@@ -70,11 +71,17 @@ class CodeSWEAgent:
             )
         else:
             self.backend = "claude"
+            # ``output_format`` is claude-only for now — codex/gemini
+            # interfaces don't accept it. cl-benchmark only sets it
+            # to ``stream-json`` for ``capture_full_transcript=True``
+            # runs against the claude harness; codex/gemini variants
+            # would need their own equivalent in a future slice.
             self.interface = ClaudeCodeInterface(
                 timeout_s=subprocess_timeout_s,
                 env_overrides=env_overrides,
                 on_rate_limit_retry=on_rate_limit_retry,
                 is_cancelled=is_cancelled,
+                output_format=output_format,
             )
 
         self.prompt_formatter = PromptFormatter(prompt_template)
@@ -308,12 +315,6 @@ class CodeSWEAgent:
             }
 
         try:
-            # Inject or remove MCP config before running the agent
-            if self.mcp_enabled and self.mcp_manager:
-                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
-            else:
-                McpConfigManager.remove_mcp_json(repo_path)
-
             prompt = self.prompt_formatter.format_for_cli(instance)
             # Capture the prompt bytes we actually sent. The formatter
             # already merged the template + issue + hints; this is what
@@ -323,6 +324,20 @@ class CodeSWEAgent:
             os.chdir(repo_path)
             subprocess.run(["git", "add", "-A"], capture_output=True)
             subprocess.run(["git", "stash"], capture_output=True)
+
+            # Inject ``.mcp.json`` AFTER the ``git add -A`` + ``git stash``
+            # cleanup. The stash hides any retry-leftover working-tree
+            # modifications, and ``-A`` would have staged ``.mcp.json``
+            # too — so writing it before the stash silently swept it
+            # away, leaving Claude Code with no MCP servers to load.
+            # Writing it post-stash keeps the file on disk + untracked
+            # for the duration of the agent run; ``inject_mcp_json``
+            # overwrites any prior copy and ``remove_mcp_json`` clears
+            # it for non-MCP runs.
+            if self.mcp_enabled and self.mcp_manager:
+                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
+            else:
+                McpConfigManager.remove_mcp_json(repo_path)
 
             model_info = f" with model {self.model_alias}" if self.model else ""
             print(f"Running {self.backend.title()} Code{model_info}...")
@@ -557,6 +572,7 @@ def run_shard(
     env_overrides: Optional[Dict[str, str]] = None,
     rate_limit_callback: Optional[Callable[[Any], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    output_format: str = "json",
 ) -> List[Any]:
     """Shardable library entry point used by the cl-benchmark worker.
 
@@ -608,6 +624,7 @@ def run_shard(
         env_overrides=env_overrides,
         on_rate_limit_retry=rate_limit_callback,
         is_cancelled=is_cancelled,
+        output_format=output_format,
     )
 
     dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")
