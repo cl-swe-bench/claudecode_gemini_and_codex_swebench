@@ -145,24 +145,19 @@ Issue Description:
 I've already taken care of all changes to any of the test files described in the issue description. This means you DON'T have to modify the testing logic or any of the tests in any way. Your task is to make the minimal changes to non-test files in the repository to satisfy the issue description.
 
 Codebase context tools (call these ONCE per task — share the result, don't re-fetch):
-  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
-    Call BEFORE any grep/find/Read or before delegating to a subagent.
-  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.
-    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.
+- mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
+    Call BEFORE any grep/find/Read or before delegating to the Explore subagent.
 
 For all Code Lexica calls, pass repoIdentifier="{repo_identifier}".
 
 Your task:
 1. Understand the issue by carefully reading the description
-2. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch codebase context. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
-3. Search the codebase to find relevant files using grep, find, or other search tools
-4. Analyze the code to understand the root cause
-5. Call mcp__code-lexica__get_implementation_guide if your fix will touch business logic, endpoints, models, or routes. Do this BEFORE generating a fix.
-6. Generate a fix that resolves the issue.
-7. Ensure your fix doesn't break existing functionality
+2. Always use mcp__code-lexica__get_codebase_context to fetch context on the codebase FIRST – before beginning or spinning up subagents.
+3. Analyze the code to understand the root cause
+4. Generate a fix that resolves the issue. 
+5. Ensure your fix doesn't break existing functionality
 
 Important notes:
-- Leverage the context from the codebase context tools provided throughout your process.
 - Focus on making minimal, targeted changes
 - Consider edge cases and potential side effects
 - Output clear file edits showing exactly what needs to be changed
