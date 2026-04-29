@@ -27,7 +27,12 @@ fixtures.
 
 ### Subagents
 
-Subagents inherit access to these MCP tools. When you delegate, pass
-the `repoIdentifier` along and instruct the subagent to call
-`get_codebase_context` first if it'll be doing broad exploration.
+Subagents inherit access to these MCP tools, but you should NOT have
+subagents call `get_codebase_context` themselves — that fetches the
+same data twice and bloats the conversation cache. Instead: call
+`get_codebase_context` ONCE at the top of your work, then INCLUDE the
+returned context verbatim in any subagent brief. Subagents can still
+make targeted Code Lexica calls (e.g. `get_implementation_guide` when
+they're tasked with implementing a specific feature) where the context
+they need differs from yours.
 <!-- code-lexica:end -->

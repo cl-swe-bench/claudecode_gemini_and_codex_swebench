@@ -399,7 +399,9 @@ class CodeSWEAgent:
 
             model_info = f" with model {self.model_alias}" if self.model else ""
             print(f"Running {self.backend.title()} Code{model_info}...")
-            result = self.interface.execute_code_cli(prompt, repo_path, self.model)
+            result = self.interface.execute_code_cli(
+                prompt, repo_path, self.model, instance_id=instance_id
+            )
 
             token_usage = result.get("token_usage", {})
 

@@ -93,13 +93,24 @@ class ClaudeCodeInterface:
                 "Claude CLI not found. Please ensure 'claude' is installed and in PATH"
             )
 
-    def execute_code_cli(self, prompt: str, cwd: str, model: str = None) -> Dict[str, Any]:
+    def execute_code_cli(
+        self,
+        prompt: str,
+        cwd: str,
+        model: str = None,
+        *,
+        instance_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Execute Claude Code via CLI, retrying on rate-limit errors.
 
         Args:
             prompt: The prompt to send to Claude.
             cwd: Working directory to execute in.
             model: Optional model to use (e.g., 'opus-4.1', 'sonnet-3.7').
+            instance_id: Optional SWE-bench instance id, threaded into
+                the ``RateLimitEvent`` payload so the worker can label
+                rate-limit telemetry with the instance that hit it.
+                Standalone CLI use leaves this ``None``.
         """
         return with_rate_limit_retry(
             call=lambda: self._single_invocation(prompt, cwd, model),
@@ -108,6 +119,7 @@ class ClaudeCodeInterface:
             on_retry=self.on_rate_limit_retry,
             interface="claude",
             is_cancelled=self.is_cancelled,
+            instance_id=instance_id,
         )
 
     def _single_invocation(

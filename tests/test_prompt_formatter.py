@@ -243,12 +243,18 @@ def test_nudge_template_inserts_codebase_context_block():
         repo_identifier="https://github.com/acme/widget.git",
     )
     prompt = formatter.format_issue(_basic_instance())
-    # Block header + both tool names land verbatim.
-    assert "Codebase context tools (call these first; subagents have access too):" in prompt
+    # Block header (call-once + share-result framing) + both tool names land verbatim.
+    assert (
+        "Codebase context tools (call these ONCE per task — share the result, don't re-fetch):"
+        in prompt
+    )
     assert "mcp__code-lexica__get_codebase_context" in prompt
     assert "mcp__code-lexica__get_implementation_guide" in prompt
     # 7-step task list — the new MCP-first step + the get_implementation_guide step.
-    assert "2. Always use mcp__code-lexica__get_codebase_context to fetch context" in prompt
+    # Step 2 says "ONCE at the start" and tells the agent to share via subagent
+    # briefs rather than have subagents re-fetch.
+    assert "2. Call mcp__code-lexica__get_codebase_context ONCE at the start" in prompt
+    assert "INCLUDE the returned context in the subagent brief verbatim" in prompt
     assert "5. Call mcp__code-lexica__get_implementation_guide if your fix" in prompt
     assert "7. Ensure your fix doesn't break existing functionality" in prompt
 
