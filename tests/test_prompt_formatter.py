@@ -160,7 +160,9 @@ def test_format_issue_drops_being_evaluated_framing():
 def test_format_issue_includes_dont_touch_tests_nudge():
     """Matches Pro-os's ``tool_use.yaml`` directive: test files are
     off-limits to the agent. Regression guard against the nudge being
-    dropped in a future edit."""
+    dropped or paraphrased in a future edit. Strings are upstream's
+    verbatim — including the ``non-tests files`` typo (extra ``s``)
+    that we mirror for parity."""
     formatter = PromptFormatter()
     prompt = formatter.format_issue({
         "instance_id": "x",
@@ -172,7 +174,9 @@ def test_format_issue_includes_dont_touch_tests_nudge():
     # explicit "don't modify tests" directive.
     assert "I've already taken care of" in prompt
     assert "DON'T have to modify the testing logic" in prompt
-    assert "non-test files" in prompt
+    # Upstream's exact spelling — keep verbatim for byte-for-byte
+    # parity with the published Pro-os baseline.
+    assert "non-tests files" in prompt
 
 
 def test_format_issue_drops_conflicting_tests_should_pass_note():
@@ -190,10 +194,13 @@ def test_format_issue_drops_conflicting_tests_should_pass_note():
     assert "tests should pass after applying" not in prompt
 
 
-def test_format_issue_issue_title_is_first_line_of_problem_statement_only():
-    """``issue_title`` in the template is still the first line of the
-    *original* problem_statement — enriching the body shouldn't
-    accidentally promote "Requirements:" into the title slot."""
+def test_format_issue_problem_statement_appears_inside_pr_description_block():
+    """The byte-for-byte upstream wrapper places ``{problem_statement}``
+    inside ``<pr_description>...</pr_description>`` with no separate
+    title slot — title is just the first line of the body. Regression
+    guard against the wrapper drifting back to the old paraphrase that
+    extracted ``Issue: ...`` into a header line.
+    """
     formatter = PromptFormatter()
     instance = {
         "instance_id": "x",
@@ -204,10 +211,12 @@ def test_format_issue_issue_title_is_first_line_of_problem_statement_only():
         "interface": "I",
     }
     prompt = formatter.format_issue(instance)
-    # The first line of problem_statement appears where the title goes
-    # (template: ``Issue: {issue_title}``), not a header from the
-    # enriched body.
-    assert "Issue: One-line title" in prompt
+    # The body sits between the XML tags; the title is the first line
+    # of the body, not a separate "Issue: ..." header.
+    assert "<pr_description>\nOne-line title\n\nDetails here." in prompt
+    # The old paraphrased header must not reappear.
+    assert "Issue: One-line title" not in prompt
+    assert "Repository: acme/widget" not in prompt
 
 
 # -------------------- mcp_prompt_nudge variant --------------------
@@ -223,21 +232,101 @@ def _basic_instance() -> dict:
 
 
 def test_default_template_unchanged_when_nudge_off():
-    """Regression guard: nudge=False preserves the byte-shape of the
-    cc-46-full-run-regen baseline. Any drift here breaks comparability
-    with non-MCP runs.
+    """Regression guard: nudge=False emits the upstream-parity wrapper.
+    Sentinel substrings come from
+    SWE-bench_Pro-os/SWE-agent/config/tool_use.yaml's instance_template
+    verbatim — drift here breaks comparability with the published
+    Pro-os baseline.
     """
     formatter = PromptFormatter()
     prompt = formatter.format_issue(_basic_instance())
-    # Sentinel substrings unique to the default 5-step template.
-    assert "1. Understand the issue by carefully reading the description" in prompt
-    assert "2. Search the codebase to find relevant files using grep, find, or other search tools" in prompt
+    # Sentinel substrings unique to upstream's tool_use.yaml steps.
+    assert (
+        "1. As a first step, it might be a good idea to find and read code relevant to the <pr_description>"
+        in prompt
+    )
+    assert (
+        "2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error"
+        in prompt
+    )
+    assert "Your thinking should be thorough and so it's fine if it's very long." in prompt
     # The nudged variant's preamble must NOT appear.
     assert "Codebase context tools" not in prompt
     assert "mcp__code-lexica" not in prompt
 
 
+def test_default_template_byte_for_byte_matches_upstream_tool_use_yaml():
+    """Strong regression guard: the rendered default-template prompt
+    must equal upstream's
+    ``SWE-bench_Pro-os/SWE-agent/config/tool_use.yaml`` instance_template
+    after substitution, byte-for-byte. The only deviations from
+    upstream are functionally-required: ``{{working_dir}}`` →
+    ``base_path`` (we run outside swe-agent's docker container) and
+    ``{{problem_statement}}`` → ``issue_description`` (which equals
+    upstream's ``create_problem_statement`` output for a Pro-shape row).
+
+    If this test breaks, our scores are no longer apples-to-apples
+    comparable to Pro-os's published baseline. Update upstream's
+    template snapshot below ONLY when we deliberately re-sync to a
+    new upstream revision.
+    """
+    formatter = PromptFormatter()
+    instance = {
+        "instance_id": "x",
+        "repo": "acme/widget",
+        "base_commit": "",
+        "problem_statement": "Fix the bug.",
+        "requirements": "R1",
+        "interface": "I1",
+    }
+    rendered = formatter.format_issue(instance, base_path="/app")
+
+    # Upstream tool_use.yaml instance_template, with {{working_dir}} →
+    # /app and {{problem_statement}} → create_problem_statement(row)
+    # for the instance dict above.
+    expected = (
+        "<uploaded_files>\n"
+        "/app\n"
+        "</uploaded_files>\n"
+        "I've uploaded a python code repository in the directory /app. Consider the following PR description:\n"
+        "\n"
+        "<pr_description>\n"
+        "Fix the bug.\n"
+        "\n"
+        "Requirements:\n"
+        "R1\n"
+        "\n"
+        "New interfaces introduced:\n"
+        "I1\n"
+        "</pr_description>\n"
+        "\n"
+        "Can you help me implement the necessary changes to the repository so that the requirements specified in the <pr_description> are met?\n"
+        "I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
+        "Your task is to make the minimal changes to non-tests files in the /app directory to ensure the <pr_description> is satisfied.\n"
+        "Follow these steps to resolve the issue:\n"
+        "1. As a first step, it might be a good idea to find and read code relevant to the <pr_description>\n"
+        "2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error\n"
+        "3. Edit the source code of the repo to resolve the issue\n"
+        "4. Rerun your reproduce script and confirm that the error is fixed!\n"
+        "5. Think about edgecases and make sure your fix handles them as well\n"
+        "Your thinking should be thorough and so it's fine if it's very long."
+    )
+    assert rendered == expected, (
+        "Default-template render diverged from upstream tool_use.yaml. "
+        "Diff (rendered → expected):\n"
+        + "\n".join(
+            f"  {i}: {r!r} != {e!r}"
+            for i, (r, e) in enumerate(zip(rendered.splitlines(), expected.splitlines()))
+            if r != e
+        )
+    )
+
+
 def test_nudge_template_inserts_codebase_context_block():
+    """The MCP-nudge variant is upstream's wrapper + 1 inserted block
+    (Codebase context tools) + 1 prepended task-list step. Upstream's
+    original 5 steps stay verbatim, renumbered to 2-6.
+    """
     formatter = PromptFormatter(
         mcp_prompt_nudge=True,
         repo_identifier="https://github.com/acme/widget.git",
@@ -250,13 +339,29 @@ def test_nudge_template_inserts_codebase_context_block():
     )
     assert "mcp__code-lexica__get_codebase_context" in prompt
     assert "mcp__code-lexica__get_implementation_guide" in prompt
-    # 7-step task list — the new MCP-first step + the get_implementation_guide step.
-    # Step 2 says "ONCE at the start" and tells the agent to share via subagent
-    # briefs rather than have subagents re-fetch.
-    assert "2. Call mcp__code-lexica__get_codebase_context ONCE at the start" in prompt
+    # New step 1 is the MCP context fetch; upstream's "find and read
+    # code relevant to the <pr_description>" line is renumbered to step 2.
+    assert "1. Call mcp__code-lexica__get_codebase_context ONCE at the start" in prompt
     assert "INCLUDE the returned context in the subagent brief verbatim" in prompt
-    assert "5. Call mcp__code-lexica__get_implementation_guide if your fix" in prompt
-    assert "7. Ensure your fix doesn't break existing functionality" in prompt
+    assert (
+        "2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>"
+        in prompt
+    )
+    assert (
+        "3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error"
+        in prompt
+    )
+    assert "6. Think about edgecases and make sure your fix handles them as well" in prompt
+    # Upstream's tail is preserved.
+    assert prompt.endswith(
+        "Your thinking should be thorough and so it's fine if it's very long."
+    )
+    # The conditional implementation_guide step from the previous spec
+    # is gone; the tool is mentioned in the tools block as available
+    # but isn't a hard step.
+    assert "5. Call mcp__code-lexica__get_implementation_guide" not in prompt
+    # No "Important notes" block in the simplified variant.
+    assert "Important notes:" not in prompt
 
 
 def test_nudge_template_substitutes_repo_identifier():
@@ -279,6 +384,80 @@ def test_nudge_template_handles_missing_repo_identifier():
     prompt = formatter.format_issue(_basic_instance())
     assert 'repoIdentifier=""' in prompt
     assert "{repo_identifier}" not in prompt
+
+
+def test_nudge_template_byte_for_byte_matches_spec():
+    """Strong regression guard for the MCP nudge template's exact
+    rendered shape. The opening through the "Your task is to make the
+    minimal changes to non-tests files…" line is byte-for-byte upstream
+    ``tool_use.yaml``; what follows is byte-for-byte the spec at
+    ``cl-benchmark/docs/mcp-priming-spec.md`` "Prompt nudge template".
+
+    If this test breaks, MCP-nudge runs are no longer cleanly comparable
+    to either upstream-baseline runs (wrapper drift) or to prior
+    nudge-on cohorts (nudge-content drift). Update the snapshot below
+    ONLY when re-spec'ing the MCP nudge intentionally.
+    """
+    formatter = PromptFormatter(
+        mcp_prompt_nudge=True,
+        repo_identifier="https://github.com/acme/widget.git",
+    )
+    instance = {
+        "instance_id": "x",
+        "repo": "acme/widget",
+        "base_commit": "",
+        "problem_statement": "Fix the bug.",
+        "requirements": "R1",
+        "interface": "I1",
+    }
+    rendered = formatter.format_issue(instance, base_path="/app")
+
+    expected = (
+        "<uploaded_files>\n"
+        "/app\n"
+        "</uploaded_files>\n"
+        "I've uploaded a python code repository in the directory /app. Consider the following PR description:\n"
+        "\n"
+        "<pr_description>\n"
+        "Fix the bug.\n"
+        "\n"
+        "Requirements:\n"
+        "R1\n"
+        "\n"
+        "New interfaces introduced:\n"
+        "I1\n"
+        "</pr_description>\n"
+        "\n"
+        "Can you help me implement the necessary changes to the repository so that the requirements specified in the <pr_description> are met?\n"
+        "I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
+        "Your task is to make the minimal changes to non-tests files in the /app directory to ensure the <pr_description> is satisfied.\n"
+        "\n"
+        "Codebase context tools (call these ONCE per task — share the result, don't re-fetch):\n"
+        "  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.\n"
+        "    Call BEFORE any grep/find/Read or before delegating to a subagent.\n"
+        "  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.\n"
+        "    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.\n"
+        "\n"
+        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git".\n'
+        "\n"
+        "Follow these steps to resolve the issue:\n"
+        "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch codebase context. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
+        "2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>\n"
+        "3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error\n"
+        "4. Edit the source code of the repo to resolve the issue\n"
+        "5. Rerun your reproduce script and confirm that the error is fixed!\n"
+        "6. Think about edgecases and make sure your fix handles them as well\n"
+        "Your thinking should be thorough and so it's fine if it's very long."
+    )
+    assert rendered == expected, (
+        "MCP-nudge render diverged from the locked spec. "
+        "Diff (rendered → expected):\n"
+        + "\n".join(
+            f"  {i}: {r!r} != {e!r}"
+            for i, (r, e) in enumerate(zip(rendered.splitlines(), expected.splitlines()))
+            if r != e
+        )
+    )
 
 
 def test_external_template_path_takes_precedence_over_nudge(tmp_path):

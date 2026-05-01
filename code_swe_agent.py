@@ -35,6 +35,67 @@ from utils.mcp_config import (
 DEFAULT_BACKEND = os.environ.get("CODE_SWE_BACKEND", "claude")
 
 
+def _projects_dir() -> Path:
+    """Resolve ``$HOME/.claude/projects/`` for the current process.
+
+    Claude Code persists per-cwd state (auto-memory, todos, plans, file
+    history, full conversation jsonl) in this directory. cl-benchmark's
+    contamination analysis flagged the auto-memory subdir as a leak path
+    when the same instance is re-run (the encoded cwd is keyed on
+    instance_id, so retries / sampling collide). Reading via
+    ``Path.home()`` instead of a hard-coded path picks up cl-benchmark's
+    per-shard HOME relocation automatically.
+    """
+    return Path.home() / ".claude" / "projects"
+
+
+def _snapshot_projects_dir() -> set[str]:
+    """Capture the set of immediate child directory names in
+    ``~/.claude/projects/`` so we can later identify which were created
+    during this instance run.
+
+    Returns an empty set when the dir doesn't exist (fresh box, fresh
+    HOME, post-cleanup) — matches the natural "nothing was here yet"
+    semantic. Never raises; a snapshot failure means the post-instance
+    cleanup will conservatively skip removal rather than fail.
+    """
+    try:
+        d = _projects_dir()
+        if not d.exists():
+            return set()
+        return {p.name for p in d.iterdir() if p.is_dir()}
+    except OSError:
+        return set()
+
+
+def _cleanup_new_project_dirs(before: set[str]) -> None:
+    """Remove any ``~/.claude/projects/`` subdir that appeared since the
+    paired ``_snapshot_projects_dir`` call.
+
+    Defensive: silent on every failure path. An orphan project dir is
+    a contamination risk but a cleanup error must not fail the
+    instance. Worker-level shard HOME cleanup is the second line of
+    defense — for api_key runs the entire HOME gets ``rmtree``'d on
+    shard exit, so a missed cleanup here just delays GC by one shard
+    lifetime, not forever.
+    """
+    try:
+        d = _projects_dir()
+        if not d.exists():
+            return
+        for entry in d.iterdir():
+            if not entry.is_dir() or entry.name in before:
+                continue
+            try:
+                shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                # ignore_errors=True already swallows most things; the
+                # outer catch handles the unlikely OSError that escapes.
+                pass
+    except OSError:
+        pass
+
+
 def _resolve_repo_identifier(repo_path: str, fallback_repo: str) -> str:
     """Resolve the cloned repo's git remote URL for use as the Code
     Lexica ``repoIdentifier``. Used for both the nudged prompt template
@@ -173,7 +234,9 @@ class CodeSWEAgent:
         self.pred_timestamp: Optional[str] = None
         self.pred_file: Optional[Path] = None
 
-    def setup_repository(self, instance: Dict) -> Tuple[Optional[str], str, str]:
+    def setup_repository(
+        self, instance: Dict, *, cwd_suffix: Optional[str] = None
+    ) -> Tuple[Optional[str], str, str]:
         """Set up a repository for testing.
 
         Returns a ``(path, stdout, stderr)`` triple. On failure ``path`` is
@@ -182,13 +245,27 @@ class CodeSWEAgent:
         ``raw_stderr`` so downstream log uploads + the run-detail UI show
         the real reason rather than a generic "Failed to set up
         repository" string.
+
+        ``cwd_suffix``, when provided, is appended to the temp dir name as
+        ``swe_bench_<instance_id>__<cwd_suffix>``. cl-benchmark's worker
+        passes a per-attempt suffix here to give every attempt its own
+        filesystem namespace — eliminates retry / sampling contamination
+        through ``~/.claude/projects/<encoded-cwd>/`` (see
+        cl-benchmark/docs/cross-instance-contamination-analysis.md). The
+        underscore-pair separator avoids collisions with instance ids that
+        already contain hyphens. Default ``None`` preserves the legacy
+        path for direct CLI callers of this harness.
         """
         instance_id = instance["instance_id"]
         repo_name = instance["repo"]
         base_commit = instance["base_commit"]
 
-        # Create temporary directory for this instance (cross-platform)
-        temp_dir = Path(tempfile.gettempdir()) / f"swe_bench_{instance_id}"
+        # Create temporary directory for this instance (cross-platform).
+        # ``cwd_suffix`` lets cl-benchmark scope the path per-attempt so
+        # samples / retries of the same instance never share a project
+        # memory namespace.
+        suffix_part = f"__{cwd_suffix}" if cwd_suffix else ""
+        temp_dir = Path(tempfile.gettempdir()) / f"swe_bench_{instance_id}{suffix_part}"
 
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
@@ -301,8 +378,18 @@ class CodeSWEAgent:
                 print(chdir_msg)
             return None, "\n".join(stdout_parts), "\n".join(stderr_parts)
             
-    def process_instance(self, instance: Dict) -> Dict:
-        """Process a single SWE-bench instance."""
+    def process_instance(
+        self, instance: Dict, *, cwd_suffix: Optional[str] = None
+    ) -> Dict:
+        """Process a single SWE-bench instance.
+
+        ``cwd_suffix`` flows down into ``setup_repository`` and the prompt
+        formatter so the agent's cwd, the prompt's ``Base directory:``
+        line, and any harness logging all reference the same suffixed
+        path. cl-benchmark's worker passes a per-attempt suffix here for
+        sample/retry isolation; defaults to ``None`` for legacy direct
+        callers.
+        """
         instance_id = instance["instance_id"]
         print(f"\nProcessing {instance_id}")
 
@@ -324,7 +411,18 @@ class CodeSWEAgent:
             "formatted_prompt": None,
         }
 
-        repo_path, setup_stdout, setup_stderr = self.setup_repository(instance)
+        repo_path, setup_stdout, setup_stderr = self.setup_repository(
+            instance, cwd_suffix=cwd_suffix
+        )
+        # Snapshot ``$HOME/.claude/projects/`` BEFORE invoking claude-code
+        # so the finally block can rm any directory the CLI created during
+        # this instance. Closes the project-memory contamination channel
+        # documented in cl-benchmark/docs/cross-instance-contamination-analysis.md
+        # without depending on knowing the CLI's path-encoding scheme.
+        # Path.home() picks up cl-benchmark's per-shard HOME relocation
+        # for api_key runs and the host HOME for Max runs — correct in
+        # both cases.
+        projects_before = _snapshot_projects_dir()
         # Slice C: setup-phase streams travel on their own keys so the
         # UI's Setup tab can render them distinctly from CLI output.
         # Included on every return path so the Setup tab has something
@@ -375,7 +473,12 @@ class CodeSWEAgent:
             )
             self.prompt_formatter.repo_identifier = repo_identifier
 
-            prompt = self.prompt_formatter.format_for_cli(instance)
+            # Pass the actual cloned path so the prompt's ``Base
+            # directory:`` line matches the agent's real cwd — matters
+            # whenever ``cwd_suffix`` is set.
+            prompt = self.prompt_formatter.format_for_cli(
+                instance, base_path=str(repo_path)
+            )
             # Capture the prompt bytes we actually sent. The formatter
             # already merged the template + issue + hints; this is what
             # the CLI reads from stdin.
@@ -465,6 +568,12 @@ class CodeSWEAgent:
 
             if repo_path and os.path.exists(repo_path):
                 shutil.rmtree(repo_path)
+
+            # Remove any ``~/.claude/projects/<encoded-cwd>/`` directory
+            # claude-code created during this instance. Defensive: never
+            # raises — a leftover residue is a contamination risk but a
+            # cleanup failure shouldn't fail the run.
+            _cleanup_new_project_dirs(projects_before)
     def _save_result(self, instance_id: str, result: Dict, patch: str):
         """Save detailed results for debugging."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -634,6 +743,7 @@ def run_shard(
     is_cancelled: Optional[Callable[[], bool]] = None,
     output_format: str = "json",
     mcp_prompt_nudge: bool = False,
+    cwd_suffix: Optional[str] = None,
 ) -> List[Any]:
     """Shardable library entry point used by the cl-benchmark worker.
 
@@ -728,7 +838,7 @@ def run_shard(
 
         start_monotonic = time.monotonic()
         try:
-            prediction = agent.process_instance(instance)
+            prediction = agent.process_instance(instance, cwd_suffix=cwd_suffix)
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -775,6 +885,10 @@ def run_shard(
         if duration_ms is None:
             duration_ms = int((time.monotonic() - start_monotonic) * 1000)
         num_turns = token_usage_raw.get("num_turns")
+        # Cumulative cost CC computed across all models + all result
+        # batches. Surfaced separately from ``token_usage`` so the
+        # worker can prefer it over recomputing from token counts.
+        cli_total_cost_usd = token_usage_raw.get("cost_usd")
 
         raw_stdout = prediction.get("raw_stdout", "") or ""
         raw_stderr = prediction.get("raw_stderr", "") or ""
@@ -814,6 +928,7 @@ def run_shard(
             token_usage=token_usage,
             duration_ms=duration_ms,
             num_turns=num_turns,
+            cli_total_cost_usd=cli_total_cost_usd,
             raw_stdout=raw_stdout,
             raw_stderr=raw_stderr,
             error_message=error_message,

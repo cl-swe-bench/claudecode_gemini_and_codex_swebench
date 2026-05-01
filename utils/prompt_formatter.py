@@ -27,15 +27,18 @@ def _concat_problem_statement(
     ``interface`` (~1 KB of API-shape prose) populated on every row. Lite
     and older Pro snapshots don't carry them, so missing / empty fields
     fall through to just ``problem_statement`` unchanged — no change in
-    behavior for Lite runs. Whitespace-only values are treated as empty.
+    behavior for Lite runs. Whitespace-only values are treated as
+    absent (no empty section header), but populated values are
+    substituted verbatim — including any leading / trailing whitespace
+    the dataset row carries. Upstream's ``create_problem_statement``
+    f-strings the values straight in; we mirror that for byte-for-byte
+    parity with the Pro-os baseline.
     """
     parts = [problem_statement or ""]
-    req = (requirements or "").strip()
-    if req:
-        parts.append(f"\n\nRequirements:\n{req}")
-    iface = (interface or "").strip()
-    if iface:
-        parts.append(f"\n\nNew interfaces introduced:\n{iface}")
+    if requirements and requirements.strip():
+        parts.append(f"\n\nRequirements:\n{requirements}")
+    if interface and interface.strip():
+        parts.append(f"\n\nNew interfaces introduced:\n{interface}")
     return "".join(parts)
 
 
@@ -79,94 +82,122 @@ class PromptFormatter:
         if self.mcp_prompt_nudge:
             return self._mcp_nudge_template()
 
-        # Default template.
+        # Byte-for-byte mirror of SWE-bench_Pro-os's tool_use.yaml
+        # `instance_template` (the config Pro-os's README points users
+        # at: ``--config config/tool_use.yaml``). The only deviations
+        # from upstream are functionally-required substitutions:
         #
-        # Aligned with SWE-bench_Pro-os's `tool_use.yaml` instance
-        # template in two ways:
-        #   * No "being evaluated on SWE-bench" framing. Pro-os never
-        #     tells its agent the task is a benchmark; doing so leaks
-        #     meta-context and may nudge the model to behave
-        #     differently (more cautious, more verbose) than the
-        #     reference runs. Opening sentence just describes the
-        #     workspace.
-        #   * Don't-touch-tests nudge lifted from Pro-os verbatim.
-        #     The statement is a directional nudge (Pro-os's flow
-        #     doesn't actually apply test_patch before the agent
-        #     runs either — ours doesn't either; the evaluator
-        #     re-applies test_patch at grading time in both flows).
-        #     Dropping the old "tests should pass after applying
-        #     your fix" note that conflicted with the nudge.
-        return """You have access to a repository with a software issue that needs to be fixed.
+        #   * upstream ``{{working_dir}}`` → our ``{base_path}``,
+        #     because cl-benchmark runs the agent locally outside
+        #     swe-agent's docker container so the repo lives at the
+        #     actual cloned path rather than at ``/<repo_name>``.
+        #   * upstream ``{{problem_statement}}`` → our
+        #     ``{issue_description}``, where ``issue_description`` is
+        #     the output of ``_concat_problem_statement()`` — itself
+        #     a byte-for-byte mirror of Pro-os's
+        #     ``create_problem_statement()``.
+        #
+        # Anything else (Python-script step, "non-tests files" with the
+        # extra ``s``, the "Your thinking should be thorough" tail) is
+        # kept verbatim. Drift from this template = drift from the
+        # published Pro-os baseline; scores stop being apples-to-apples
+        # comparable. Source:
+        # SWE-bench_Pro-os/SWE-agent/config/tool_use.yaml.
+        return """<uploaded_files>
+{base_path}
+</uploaded_files>
+I've uploaded a python code repository in the directory {base_path}. Consider the following PR description:
 
-Repository: {repo_name}
-Issue: {issue_title}
-
-Issue Description:
+<pr_description>
 {issue_description}
+</pr_description>
 
-I've already taken care of all changes to any of the test files described in the issue description. This means you DON'T have to modify the testing logic or any of the tests in any way. Your task is to make the minimal changes to non-test files in the repository to satisfy the issue description.
-
-Your task:
-1. Understand the issue by carefully reading the description
-2. Search the codebase to find relevant files using grep, find, or other search tools
-3. Analyze the code to understand the root cause
-4. Generate a fix that resolves the issue
-5. Ensure your fix doesn't break existing functionality
-
-Important notes:
-- Focus on making minimal, targeted changes
-- Consider edge cases and potential side effects
-- Output clear file edits showing exactly what needs to be changed
-
-Base directory: {base_path}
-"""
+Can you help me implement the necessary changes to the repository so that the requirements specified in the <pr_description> are met?
+I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
+Your task is to make the minimal changes to non-tests files in the {base_path} directory to ensure the <pr_description> is satisfied.
+Follow these steps to resolve the issue:
+1. As a first step, it might be a good idea to find and read code relevant to the <pr_description>
+2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
+3. Edit the source code of the repo to resolve the issue
+4. Rerun your reproduce script and confirm that the error is fixed!
+5. Think about edgecases and make sure your fix handles them as well
+Your thinking should be thorough and so it's fine if it's very long."""
 
     def _mcp_nudge_template(self) -> str:
         """MCP-aware variant of the default template — emitted when the
-        caller passes ``mcp_prompt_nudge=True``. Adds a "Codebase context
-        tools" block before the task list and grows the task list from 5
-        to 7 steps to put MCP usage ahead of native search.
+        caller passes ``mcp_prompt_nudge=True``.
+
+        Byte-for-byte equal to ``_default_template`` (upstream
+        ``tool_use.yaml``) with two MCP-specific insertions:
+
+        * Between the "Your task is to make the minimal changes…" line
+          and the "Follow these steps to resolve the issue:" line, a
+          ``Codebase context tools`` block names both Code Lexica MCP
+          tools and describes when to call each, followed by the
+          ``repoIdentifier`` directive.
+        * As the new first step in upstream's numbered task list, a
+          mandatory ``get_codebase_context`` call (with
+          subagent-sharing nudge to avoid redundant re-fetches).
+          Upstream's original 5 steps follow as steps 2-6, verbatim.
+
+        Upstream's "Your thinking should be thorough…" tail is kept;
+        no "Important notes" block is added — keeping the MCP variant
+        as close to upstream as possible while still exercising the
+        MCP tools. The implementation_guide tool is described in the
+        tools block but isn't a hard step; the agent decides whether
+        to call it based on the in-block prose ("Call BEFORE writing
+        the fix when it touches business logic…").
 
         ``{repo_identifier}`` is substituted at format time. cl-benchmark
         threads the resolved git remote URL down through ``run_shard``;
         callers without an identifier get an empty string and the prompt
         still parses (the agent can still call ``git remote get-url
         origin`` itself). Spec:
-        cl-benchmark/docs/mcp-priming-spec.md.
+        cl-benchmark/docs/mcp-priming-spec.md (Prompt nudge template).
         """
-        return """You have access to a repository with a software issue that needs to be fixed.
+        return """<uploaded_files>
+{base_path}
+</uploaded_files>
+I've uploaded a python code repository in the directory {base_path}. Consider the following PR description:
 
-Repository: {repo_name}
-Issue: {issue_title}
-
-Issue Description:
+<pr_description>
 {issue_description}
+</pr_description>
 
-I've already taken care of all changes to any of the test files described in the issue description. This means you DON'T have to modify the testing logic or any of the tests in any way. Your task is to make the minimal changes to non-test files in the repository to satisfy the issue description.
+Can you help me implement the necessary changes to the repository so that the requirements specified in the <pr_description> are met?
+I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
+Your task is to make the minimal changes to non-tests files in the {base_path} directory to ensure the <pr_description> is satisfied.
 
 Codebase context tools (call these ONCE per task — share the result, don't re-fetch):
-- mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
-    Call BEFORE any grep/find/Read or before delegating to the Explore subagent.
+  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
+    Call BEFORE any grep/find/Read or before delegating to a subagent.
+  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.
+    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.
 
 For all Code Lexica calls, pass repoIdentifier="{repo_identifier}".
 
-Your task:
-1. Understand the issue by carefully reading the description
-2. Always use mcp__code-lexica__get_codebase_context to fetch context on the codebase FIRST – before beginning or spinning up subagents.
-3. Analyze the code to understand the root cause
-4. Generate a fix that resolves the issue. 
-5. Ensure your fix doesn't break existing functionality
+Follow these steps to resolve the issue:
+1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch codebase context. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
+2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>
+3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
+4. Edit the source code of the repo to resolve the issue
+5. Rerun your reproduce script and confirm that the error is fixed!
+6. Think about edgecases and make sure your fix handles them as well
+Your thinking should be thorough and so it's fine if it's very long."""
 
-Important notes:
-- Focus on making minimal, targeted changes
-- Consider edge cases and potential side effects
-- Output clear file edits showing exactly what needs to be changed
+    def format_issue(
+        self, instance: Dict, *, base_path: Optional[str] = None
+    ) -> str:
+        """Format a SWE-bench instance into a prompt for Claude Code.
 
-Base directory: {base_path}
-"""
-
-    def format_issue(self, instance: Dict) -> str:
-        """Format a SWE-bench instance into a prompt for Claude Code."""
+        ``base_path`` overrides the default ``<tempdir>/swe_bench_<iid>``
+        path that the formatter would otherwise compute. Pass the actual
+        cloned path here so the prompt's ``Base directory:`` line matches
+        the agent's real cwd — matters when the caller adds a per-attempt
+        suffix to the cwd (cl-benchmark's worker does this for sample
+        isolation; see ``setup_repository``'s ``cwd_suffix`` arg).
+        Default ``None`` reproduces legacy behavior for direct callers.
+        """
         # Extract key information from the instance
         repo_name = instance.get("repo", "")
         problem_statement = instance.get("problem_statement", "")
@@ -188,14 +219,17 @@ Base directory: {base_path}
         # Get instance_id for tracking
         instance_id = instance.get("instance_id", "")
 
-        # Format the prompt
-        base_path = Path(tempfile.gettempdir()) / f"swe_bench_{instance_id}"
+        # Default base_path matches setup_repository's cwd_suffix=None
+        # path so direct CLI users still see the legacy ``Base directory:``
+        # line. cl-benchmark callers pass the resolved suffixed path.
+        if base_path is None:
+            base_path = str(Path(tempfile.gettempdir()) / f"swe_bench_{instance_id}")
 
         prompt = self.base_template.format(
             repo_name=repo_name,
             issue_title=issue_title,
             issue_description=issue_description,
-            base_path=str(base_path),
+            base_path=base_path,
             instance_id=instance_id,
             base_commit=base_commit,
             repo_identifier=self.repo_identifier or "",
@@ -206,10 +240,15 @@ Base directory: {base_path}
             prompt += f"\n\nHints:\n{instance['hints_text']}"
 
         return prompt
-    
-    def format_for_cli(self, instance: Dict) -> str:
-        """Format the prompt for Claude Code CLI execution."""
-        base_prompt = self.format_issue(instance)
+
+    def format_for_cli(
+        self, instance: Dict, *, base_path: Optional[str] = None
+    ) -> str:
+        """Format the prompt for Claude Code CLI execution.
+
+        See ``format_issue`` for the ``base_path`` override semantics.
+        """
+        base_prompt = self.format_issue(instance, base_path=base_path)
 
         # Return the raw prompt without escaping for CLI input
         return base_prompt
