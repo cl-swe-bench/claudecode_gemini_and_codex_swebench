@@ -104,6 +104,36 @@ def test_retry_succeeds_after_two_hits():
     assert [e.attempt for e in events] == [1, 2]
     # Exponential backoff: base * 2^(attempt-1) = 1, 2
     assert sleeps.sleeps == [1.0, 2.0]
+    # No instance_id provided → both events carry None.
+    assert [e.instance_id for e in events] == [None, None]
+
+
+def test_retry_event_carries_instance_id_when_provided():
+    """``with_rate_limit_retry`` propagates ``instance_id`` into every
+    emitted ``RateLimitEvent`` so the worker can label per-instance
+    retry telemetry. Pre-2026-04-29 callers omitted the kwarg and got
+    ``None`` (covered by ``test_retry_succeeds_after_two_hits``)."""
+
+    sleeps = _SleepRecorder()
+    events: list = []
+    calls = iter([_fake_rl_result(), _fake_success()])
+
+    with_rate_limit_retry(
+        call=lambda: next(calls),
+        detector=ClaudeRateLimitDetector(),
+        policy=RateLimitPolicy(
+            max_retries=5, base_seconds=1.0, max_seconds=10.0, jitter_seconds=0.0
+        ),
+        on_retry=events.append,
+        interface="claude",
+        sleep=sleeps,
+        rand=lambda lo, hi: 0.0,
+        instance_id="instance_acme__widget-abc123-vdef456",
+    )
+    assert len(events) == 1
+    assert events[0].instance_id == "instance_acme__widget-abc123-vdef456"
+    assert events[0].interface == "claude"
+    assert events[0].attempt == 1
 
 
 def test_retry_honors_parsed_retry_after():

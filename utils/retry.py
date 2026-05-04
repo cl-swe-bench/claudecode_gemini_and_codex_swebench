@@ -34,12 +34,21 @@ class RateLimitHit:
 
 @dataclass(frozen=True)
 class RateLimitEvent:
-    """Emitted via the ``on_retry`` callback before each sleep."""
+    """Emitted via the ``on_retry`` callback before each sleep.
+
+    ``instance_id`` is optional — the retry helper itself doesn't know
+    about SWE-bench instance ids; callers that operate per-instance
+    (``code_swe_agent.process_instance`` → ``execute_code_cli`` →
+    ``with_rate_limit_retry``) thread it through so the worker can
+    label the rate-limit event with the instance that hit it. Standalone
+    one-off invocations (no per-instance context) leave it ``None``.
+    """
 
     interface: str
     attempt: int  # 1-based — 1 = first failure, 2 = second, etc.
     wait_seconds: float
     detail: str
+    instance_id: Optional[str] = None
 
 
 @dataclass
@@ -153,6 +162,7 @@ def with_rate_limit_retry(
     sleep: Callable[[float], None] = time.sleep,
     rand: Callable[[float, float], float] = random.uniform,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    instance_id: Optional[str] = None,
 ) -> dict:
     """Invoke ``call`` until it succeeds or rate-limit attempts are exhausted.
 
@@ -198,6 +208,7 @@ def with_rate_limit_retry(
                     attempt=attempt,
                     wait_seconds=wait,
                     detail=hit.detail,
+                    instance_id=instance_id,
                 )
             )
         _cancellable_sleep(wait, sleep=sleep, is_cancelled=is_cancelled)

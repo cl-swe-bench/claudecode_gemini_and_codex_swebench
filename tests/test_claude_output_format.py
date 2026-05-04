@@ -1,14 +1,24 @@
-"""Tests for ``ClaudeCodeInterface.output_format`` + ``_extract_result_event``.
+"""Tests for ``ClaudeCodeInterface.output_format`` +
+``_summarize_results`` (the post-cost-accounting-fix successor to the
+old ``_extract_result_event`` method).
 
 Token-equivalence regression: when the SAME final ``result`` event is
 delivered as either a single JSON blob (``--output-format json``) or
 embedded as the last event in an NDJSON stream
-(``--output-format stream-json``), the extracted ``output_data`` and
-the downstream ``token_usage`` dict must be identical. cl-benchmark's
-cost rollup parses ``token_usage``, so any drift would silently
-mis-cost runs created with ``capture_full_transcript=True``.
+(``--output-format stream-json``), the summarized event and the
+downstream ``token_usage`` dict must be identical. cl-benchmark's cost
+rollup parses ``token_usage``, so any drift would silently mis-cost
+runs created with ``capture_full_transcript=True``.
 
-Spec: cl-benchmark/docs/run-transcript-capture-spec.md, Slice 1.
+Multi-result regression: Claude Code may emit multiple ``type=result``
+events per session (compaction / session-resume boundaries on any
+model). ``_summarize_results`` SUMS per-batch fields (token counts,
+duration_ms, num_turns) across events and takes cumulative fields
+(``total_cost_usd``, ``session_id``, ``modelUsage``) from the LAST
+event. Tests cover both shapes.
+
+Specs: cl-benchmark/docs/run-transcript-capture-spec.md (Slice 1) +
+cl-benchmark/docs/cost-accounting-fix-spec.md.
 """
 
 from __future__ import annotations
@@ -61,26 +71,42 @@ def _make_interface(output_format: str) -> ClaudeCodeInterface:
         return ClaudeCodeInterface(output_format=output_format)
 
 
-# ---------- _extract_result_event -------------------------------------------
+# ---------- _summarize_results ----------------------------------------------
 
 
-def test_extract_result_event_json_returns_blob():
+def _assert_matches_single_result_event(out: dict, event: dict) -> None:
+    """Helper: assert ``_summarize_results`` produced the canonical
+    summary for a single ``RESULT_EVENT``-shaped fixture. The summary
+    dict has a fixed shape (per-batch fields summed, cumulative fields
+    taken from last event); for a single event the per-batch sums equal
+    the event's values directly.
+    """
+    usage = event["usage"]
+    assert out["duration_ms"] == event["duration_ms"]
+    assert out["num_turns"] == event["num_turns"]
+    assert out["usage"] == usage
+    assert out["duration_api_ms"] == event["duration_api_ms"]
+    assert out["session_id"] == event["session_id"]
+    assert out["total_cost_usd"] == event["total_cost_usd"]
+
+
+def test_summarize_results_json_returns_summary():
     iface = _make_interface("json")
-    out = iface._extract_result_event(json.dumps(RESULT_EVENT))
-    assert out == RESULT_EVENT
+    out = iface._summarize_results(json.dumps(RESULT_EVENT))
+    _assert_matches_single_result_event(out, RESULT_EVENT)
 
 
-def test_extract_result_event_json_handles_empty_stdout():
+def test_summarize_results_json_handles_empty_stdout():
     iface = _make_interface("json")
-    assert iface._extract_result_event("") == {}
+    assert iface._summarize_results("") == {}
 
 
-def test_extract_result_event_json_handles_invalid_json():
+def test_summarize_results_json_handles_invalid_json():
     iface = _make_interface("json")
-    assert iface._extract_result_event("not-json{{{") == {}
+    assert iface._summarize_results("not-json{{{") == {}
 
 
-def test_extract_result_event_stream_finds_final_result():
+def test_summarize_results_stream_finds_final_result():
     iface = _make_interface("stream-json")
     ndjson = "\n".join(
         [
@@ -95,11 +121,11 @@ def test_extract_result_event_stream_finds_final_result():
             json.dumps(RESULT_EVENT),
         ]
     )
-    out = iface._extract_result_event(ndjson)
-    assert out == RESULT_EVENT
+    out = iface._summarize_results(ndjson)
+    _assert_matches_single_result_event(out, RESULT_EVENT)
 
 
-def test_extract_result_event_stream_returns_empty_when_no_result():
+def test_summarize_results_stream_returns_empty_when_no_result():
     iface = _make_interface("stream-json")
     ndjson = "\n".join(
         [
@@ -107,10 +133,10 @@ def test_extract_result_event_stream_returns_empty_when_no_result():
             json.dumps({"type": "assistant", "message": {}}),
         ]
     )
-    assert iface._extract_result_event(ndjson) == {}
+    assert iface._summarize_results(ndjson) == {}
 
 
-def test_extract_result_event_stream_skips_malformed_lines():
+def test_summarize_results_stream_skips_malformed_lines():
     """A single bad line in the middle of NDJSON shouldn't kill parsing."""
     iface = _make_interface("stream-json")
     ndjson = "\n".join(
@@ -120,24 +146,36 @@ def test_extract_result_event_stream_skips_malformed_lines():
             json.dumps(RESULT_EVENT),
         ]
     )
-    out = iface._extract_result_event(ndjson)
-    assert out == RESULT_EVENT
+    out = iface._summarize_results(ndjson)
+    _assert_matches_single_result_event(out, RESULT_EVENT)
 
 
-def test_extract_result_event_stream_uses_last_result_event():
-    """If multiple ``result`` events appear (shouldn't but defensive),
-    the LAST one wins. Matches the semantics of running multiple
-    invocations through one stdout — the most recent totals are
-    authoritative."""
+def test_summarize_results_stream_sums_per_batch_fields_across_multiple_results():
+    """Multi-result emission (CC compaction / session-resume): per-batch
+    fields (token counts, ``duration_ms``, ``num_turns``) sum across all
+    ``type=result`` events; cumulative fields (``total_cost_usd``,
+    ``session_id``, ``duration_api_ms``) come from the LAST event because
+    the CLI accumulates these across batches itself.
+    """
     iface = _make_interface("stream-json")
     earlier = {**RESULT_EVENT, "total_cost_usd": 0.1, "session_id": "earlier"}
     later = {**RESULT_EVENT, "total_cost_usd": 0.5, "session_id": "later"}
     ndjson = "\n".join([json.dumps(earlier), json.dumps(later)])
-    out = iface._extract_result_event(ndjson)
-    assert out == later
+    out = iface._summarize_results(ndjson)
+
+    # Per-batch — summed across both events.
+    assert out["usage"]["input_tokens"] == 1234 * 2
+    assert out["usage"]["output_tokens"] == 567 * 2
+    assert out["usage"]["cache_creation_input_tokens"] == 89 * 2
+    assert out["usage"]["cache_read_input_tokens"] == 901 * 2
+    assert out["duration_ms"] == 12345 * 2
+    assert out["num_turns"] == 7 * 2
+    # Cumulative — last event wins.
+    assert out["total_cost_usd"] == pytest.approx(0.5)
+    assert out["session_id"] == "later"
 
 
-def test_extract_result_event_stream_handles_blank_lines():
+def test_summarize_results_stream_handles_blank_lines():
     """Trailing newlines / blank lines around events shouldn't fail."""
     iface = _make_interface("stream-json")
     ndjson = (
@@ -147,8 +185,8 @@ def test_extract_result_event_stream_handles_blank_lines():
         + json.dumps(RESULT_EVENT)
         + "\n\n"
     )
-    out = iface._extract_result_event(ndjson)
-    assert out == RESULT_EVENT
+    out = iface._summarize_results(ndjson)
+    _assert_matches_single_result_event(out, RESULT_EVENT)
 
 
 # ---------- Token equivalence (the hard merge gate) -------------------------
@@ -157,10 +195,10 @@ def test_extract_result_event_stream_handles_blank_lines():
 def _token_usage_from_output(iface: ClaudeCodeInterface, stdout: str) -> dict:
     """Run the same parsing pipeline ``_single_invocation`` uses to
     populate ``token_usage`` so the test exercises the full extraction
-    path, not just ``_extract_result_event`` in isolation."""
-    output_data = iface._extract_result_event(stdout)
+    path, not just ``_summarize_results`` in isolation."""
+    output_data = iface._summarize_results(stdout)
     token_usage: dict = {}
-    if isinstance(output_data, dict):
+    if isinstance(output_data, dict) and output_data:
         usage = output_data.get("usage") or {}
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)

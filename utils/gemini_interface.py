@@ -45,8 +45,19 @@ class GeminiCodeInterface:
                 "Gemini CLI not found. Please ensure 'gemini' is installed and in PATH"
             )
 
-    def execute_code_cli(self, prompt: str, cwd: str, model: str = None) -> Dict[str, Any]:
-        """Execute Gemini via CLI, retrying on rate-limit errors."""
+    def execute_code_cli(
+        self,
+        prompt: str,
+        cwd: str,
+        model: str = None,
+        *,
+        instance_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute Gemini via CLI, retrying on rate-limit errors.
+
+        ``instance_id`` is threaded into ``RateLimitEvent`` payloads so
+        per-instance rate-limit telemetry is identifiable upstream.
+        """
         return with_rate_limit_retry(
             call=lambda: self._single_invocation(prompt, cwd, model),
             detector=self._detector,
@@ -54,6 +65,7 @@ class GeminiCodeInterface:
             on_retry=self.on_rate_limit_retry,
             interface="gemini",
             is_cancelled=self.is_cancelled,
+            instance_id=instance_id,
         )
 
     def _single_invocation(
