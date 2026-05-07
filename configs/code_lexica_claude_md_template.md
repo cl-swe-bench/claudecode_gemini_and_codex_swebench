@@ -17,22 +17,11 @@ call `mcp__code-lexica__get_codebase_context` to get the architecture,
 code map, and conventions. Then drill in with grep / find / Read using
 the narrowed surface — context first means fewer dead-end reads.
 
-**Before writing a fix that touches business logic, endpoints, models,
-routes, or background jobs**, call `mcp__code-lexica__get_implementation_guide`
-to get workflow recipes and the API/data-model reference.
-
-**When understanding existing tests** (to know what behavior to preserve),
-call `mcp__code-lexica__get_testing_guide` for test patterns and
-fixtures.
-
 ### Subagents
 
-Subagents inherit access to these MCP tools, but you should NOT have
+Subagents inherit access to this MCP tool, but you should NOT have
 subagents call `get_codebase_context` themselves — that fetches the
 same data twice and bloats the conversation cache. Instead: call
 `get_codebase_context` ONCE at the top of your work, then INCLUDE the
-returned context verbatim in any subagent brief. Subagents can still
-make targeted Code Lexica calls (e.g. `get_implementation_guide` when
-they're tasked with implementing a specific feature) where the context
-they need differs from yours.
+returned context verbatim in any subagent brief.
 <!-- code-lexica:end -->

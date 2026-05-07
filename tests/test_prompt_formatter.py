@@ -324,7 +324,7 @@ def test_default_template_byte_for_byte_matches_upstream_tool_use_yaml():
 
 def test_nudge_template_inserts_codebase_context_block():
     """The MCP-nudge variant is upstream's wrapper + 1 inserted block
-    (Codebase context tools) + 1 prepended task-list step. Upstream's
+    (Codebase context tool) + 1 prepended task-list step. Upstream's
     original 5 steps stay verbatim, renumbered to 2-6.
     """
     formatter = PromptFormatter(
@@ -332,13 +332,13 @@ def test_nudge_template_inserts_codebase_context_block():
         repo_identifier="https://github.com/acme/widget.git",
     )
     prompt = formatter.format_issue(_basic_instance())
-    # Block header (call-once + share-result framing) + both tool names land verbatim.
+    # Block header (call-once + share-result framing) + the single
+    # promoted tool name lands verbatim.
     assert (
-        "Codebase context tools (call these ONCE per task — share the result, don't re-fetch):"
+        "Codebase context tool (call ONCE per task — share the result, don't re-fetch):"
         in prompt
     )
     assert "mcp__code-lexica__get_codebase_context" in prompt
-    assert "mcp__code-lexica__get_implementation_guide" in prompt
     # New step 1 is the MCP context fetch; upstream's "find and read
     # code relevant to the <pr_description>" line is renumbered to step 2.
     assert "1. Call mcp__code-lexica__get_codebase_context ONCE at the start" in prompt
@@ -356,10 +356,11 @@ def test_nudge_template_inserts_codebase_context_block():
     assert prompt.endswith(
         "Your thinking should be thorough and so it's fine if it's very long."
     )
-    # The conditional implementation_guide step from the previous spec
-    # is gone; the tool is mentioned in the tools block as available
-    # but isn't a hard step.
-    assert "5. Call mcp__code-lexica__get_implementation_guide" not in prompt
+    # The other Code Lexica tools (implementation_guide / testing_guide)
+    # are intentionally NOT promoted — early sampled runs over-fetched
+    # when multiple tools were surfaced. Regression guard.
+    assert "implementation_guide" not in prompt
+    assert "testing_guide" not in prompt
     # No "Important notes" block in the simplified variant.
     assert "Important notes:" not in prompt
 
@@ -432,11 +433,9 @@ def test_nudge_template_byte_for_byte_matches_spec():
         "I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
         "Your task is to make the minimal changes to non-tests files in the /app directory to ensure the <pr_description> is satisfied.\n"
         "\n"
-        "Codebase context tools (call these ONCE per task — share the result, don't re-fetch):\n"
+        "Codebase context tool (call ONCE per task — share the result, don't re-fetch):\n"
         "  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.\n"
         "    Call BEFORE any grep/find/Read or before delegating to a subagent.\n"
-        "  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.\n"
-        "    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.\n"
         "\n"
         'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git".\n'
         "\n"

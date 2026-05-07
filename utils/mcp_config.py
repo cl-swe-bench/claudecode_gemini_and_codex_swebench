@@ -162,12 +162,9 @@ class McpConfigManager:
                         "understand the project, but it narrows and focuses the "
                         "search space to the most relevant files and directories so "
                         "you can use fewer tokens and waste less time reading "
-                        "irrelevant files. Call get_implementation_guide before "
-                        "implementing features, adding endpoints, creating models, "
-                        "or modifying business logic. Call get_testing_guide before "
-                        "writing any tests. Always call Code Lexica tools BEFORE "
+                        "irrelevant files. Always call get_codebase_context BEFORE "
                         "delegating to subagents — subagents may not have access to "
-                        "these tools, so fetch the context first and include it in "
+                        "this tool, so fetch the context first and include it in "
                         "your subagent instructions."
                     )
                 }

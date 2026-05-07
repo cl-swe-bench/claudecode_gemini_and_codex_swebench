@@ -132,9 +132,10 @@ Your thinking should be thorough and so it's fine if it's very long."""
 
         * Between the "Your task is to make the minimal changes…" line
           and the "Follow these steps to resolve the issue:" line, a
-          ``Codebase context tools`` block names both Code Lexica MCP
-          tools and describes when to call each, followed by the
-          ``repoIdentifier`` directive.
+          ``Codebase context tool`` block names the
+          ``get_codebase_context`` Code Lexica MCP tool and describes
+          when to call it, followed by the ``repoIdentifier``
+          directive.
         * As the new first step in upstream's numbered task list, a
           mandatory ``get_codebase_context`` call (with
           subagent-sharing nudge to avoid redundant re-fetches).
@@ -143,10 +144,12 @@ Your thinking should be thorough and so it's fine if it's very long."""
         Upstream's "Your thinking should be thorough…" tail is kept;
         no "Important notes" block is added — keeping the MCP variant
         as close to upstream as possible while still exercising the
-        MCP tools. The implementation_guide tool is described in the
-        tools block but isn't a hard step; the agent decides whether
-        to call it based on the in-block prose ("Call BEFORE writing
-        the fix when it touches business logic…").
+        MCP tool. The Code Lexica server has additional tools
+        (``get_implementation_guide`` / ``get_testing_guide``) but
+        the prompt + CLAUDE.md template intentionally don't promote
+        them — early runs showed agents over-fetching when multiple
+        tools were surfaced at once, so we narrowed the nudge to the
+        single highest-value tool.
 
         ``{repo_identifier}`` is substituted at format time. cl-benchmark
         threads the resolved git remote URL down through ``run_shard``;
@@ -168,11 +171,9 @@ Can you help me implement the necessary changes to the repository so that the re
 I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
 Your task is to make the minimal changes to non-tests files in the {base_path} directory to ensure the <pr_description> is satisfied.
 
-Codebase context tools (call these ONCE per task — share the result, don't re-fetch):
+Codebase context tool (call ONCE per task — share the result, don't re-fetch):
   - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
     Call BEFORE any grep/find/Read or before delegating to a subagent.
-  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.
-    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.
 
 For all Code Lexica calls, pass repoIdentifier="{repo_identifier}".
 
