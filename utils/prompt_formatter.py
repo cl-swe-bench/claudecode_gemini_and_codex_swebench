@@ -132,9 +132,10 @@ Your thinking should be thorough and so it's fine if it's very long."""
 
         * Between the "Your task is to make the minimal changes…" line
           and the "Follow these steps to resolve the issue:" line, a
-          ``Codebase context tools`` block names both Code Lexica MCP
-          tools and describes when to call each, followed by the
-          ``repoIdentifier`` directive.
+          ``Codebase context tool`` block names the
+          ``get_codebase_context`` Code Lexica MCP tool and describes
+          when to call it, followed by the ``repoIdentifier``
+          directive.
         * As the new first step in upstream's numbered task list, a
           mandatory ``get_codebase_context`` call (with
           subagent-sharing nudge to avoid redundant re-fetches).
@@ -143,10 +144,12 @@ Your thinking should be thorough and so it's fine if it's very long."""
         Upstream's "Your thinking should be thorough…" tail is kept;
         no "Important notes" block is added — keeping the MCP variant
         as close to upstream as possible while still exercising the
-        MCP tools. The implementation_guide tool is described in the
-        tools block but isn't a hard step; the agent decides whether
-        to call it based on the in-block prose ("Call BEFORE writing
-        the fix when it touches business logic…").
+        MCP tool. The Code Lexica server has additional tools
+        (``get_implementation_guide`` / ``get_testing_guide``) but
+        the prompt + CLAUDE.md template intentionally don't promote
+        them — early runs showed agents over-fetching when multiple
+        tools were surfaced at once, so we narrowed the nudge to the
+        single highest-value tool.
 
         ``{repo_identifier}`` is substituted at format time. cl-benchmark
         threads the resolved git remote URL down through ``run_shard``;
@@ -168,16 +171,13 @@ Can you help me implement the necessary changes to the repository so that the re
 I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
 Your task is to make the minimal changes to non-tests files in the {base_path} directory to ensure the <pr_description> is satisfied.
 
-Codebase context tools (call these ONCE per task — share the result, don't re-fetch):
-  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.
-    Call BEFORE any grep/find/Read or before delegating to a subagent.
-  - mcp__code-lexica__get_implementation_guide — workflow recipes + API/data-model reference.
-    Call BEFORE writing the fix when it touches business logic, endpoints, models, or routes.
+Codebase context tool (call ONCE per task — share the result, don't re-fetch):
+  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions, PRE-FILTERED by the server to the parts relevant to your specific task. Tells you which files/directories are relevant + how they're named so you can skip dead-end reads. Call BEFORE any grep/find/Read or before delegating to a subagent.
 
-For all Code Lexica calls, pass repoIdentifier="{repo_identifier}".
+For all Code Lexica calls, pass repoIdentifier="{repo_identifier}" and taskPrompt = the body of the <pr_description> block above (drives the server-side relevance filter; required for a task-tailored response).
 
 Follow these steps to resolve the issue:
-1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch codebase context. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
+1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body as taskPrompt so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
 2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>
 3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
 4. Edit the source code of the repo to resolve the issue
