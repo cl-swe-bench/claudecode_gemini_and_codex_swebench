@@ -339,6 +339,17 @@ def test_nudge_template_inserts_codebase_context_block():
         in prompt
     )
     assert "mcp__code-lexica__get_codebase_context" in prompt
+    # The "PRE-FILTERED by the server" + taskPrompt parameter framing
+    # is what makes the new MCP API useful — regression-guard both.
+    assert "PRE-FILTERED by the server" in prompt
+    assert "taskPrompt" in prompt
+    assert "drives the server-side relevance filter" in prompt
+    # The "use it, don't restart from scratch" nudge is the highest-
+    # leverage piece of the prompt update — pin it explicitly.
+    assert (
+        "USE the returned context to direct your subsequent reads and searches"
+        in prompt
+    )
     # New step 1 is the MCP context fetch; upstream's "find and read
     # code relevant to the <pr_description>" line is renumbered to step 2.
     assert "1. Call mcp__code-lexica__get_codebase_context ONCE at the start" in prompt
@@ -434,13 +445,12 @@ def test_nudge_template_byte_for_byte_matches_spec():
         "Your task is to make the minimal changes to non-tests files in the /app directory to ensure the <pr_description> is satisfied.\n"
         "\n"
         "Codebase context tool (call ONCE per task — share the result, don't re-fetch):\n"
-        "  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions.\n"
-        "    Call BEFORE any grep/find/Read or before delegating to a subagent.\n"
+        "  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions, PRE-FILTERED by the server to the parts relevant to your specific task. Tells you which files/directories are relevant + how they're named so you can skip dead-end reads. Call BEFORE any grep/find/Read or before delegating to a subagent.\n"
         "\n"
-        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git".\n'
+        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git" and taskPrompt = the body of the <pr_description> block above (drives the server-side relevance filter; required for a task-tailored response).\n'
         "\n"
         "Follow these steps to resolve the issue:\n"
-        "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch codebase context. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
+        "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body as taskPrompt so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
         "2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>\n"
         "3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error\n"
         "4. Edit the source code of the repo to resolve the issue\n"
