@@ -349,3 +349,113 @@ def test_mcp_config_flag_omitted_when_no_mcp_json(tmp_path):
     argv = _captured_argv("json", cwd=str(tmp_path))
     assert "--mcp-config" not in argv
     assert "--strict-mcp-config" not in argv
+
+
+# ---------- token_usage on non-success paths --------------------------------
+#
+# Pre-fix bug: ``execute_code_cli`` discarded ``result.stdout`` on the
+# timeout / cancel / exception paths and returned ``token_usage={}``.
+# ``run_with_cancel`` already stashes the partial NDJSON the CLI emitted
+# before SIGKILL — those events carry cumulative cost from prior turns
+# — so we systematically under-billed every 30-min timed-out sample by
+# the full accumulated spend ($5-15/sample empirically). The fix
+# extracts a ``_extract_token_usage`` helper called from all four
+# return paths; these tests pin the new behavior so the regression
+# can't sneak back in.
+
+
+def _drive_invocation(*, stdout: str, timed_out: bool = False, cancelled: bool = False,
+                      returncode: int = 0) -> dict:
+    """Run ``_single_invocation`` with a stubbed ``run_with_cancel``
+    return; gives back the dict the interface produced."""
+
+    iface = _make_interface("stream-json")
+
+    class _Stub:
+        pass
+
+    stub = _Stub()
+    stub.returncode = returncode
+    stub.stdout = stdout
+    stub.stderr = ""
+    stub.timed_out = timed_out
+    stub.cancelled = cancelled
+
+    with patch("utils.claude_interface.run_with_cancel", return_value=stub):
+        return iface._single_invocation("prompt", "/tmp", model=None)
+
+
+def test_token_usage_recovered_on_timeout():
+    """Timeout path now parses partial stdout — partial cost lands on
+    ``token_usage`` instead of being silently dropped."""
+    ndjson = "\n".join([
+        json.dumps({"type": "system", "session_id": "abc"}),
+        json.dumps(RESULT_EVENT),
+    ])
+    out = _drive_invocation(stdout=ndjson, timed_out=True, returncode=-1)
+    assert out["timed_out"] is True
+    assert out["success"] is False
+    assert out["token_usage"]["cost_usd"] == RESULT_EVENT["total_cost_usd"]
+    assert out["token_usage"]["input_tokens"] == RESULT_EVENT["usage"]["input_tokens"]
+    assert out["token_usage"]["num_turns"] == RESULT_EVENT["num_turns"]
+
+
+def test_token_usage_recovered_on_cancel():
+    """Cancel path mirrors the timeout fix — cancels can fire mid-
+    session with real spend already incurred, so the same partial-
+    NDJSON parse applies."""
+    ndjson = json.dumps(RESULT_EVENT)
+    out = _drive_invocation(stdout=ndjson, cancelled=True, returncode=-15)
+    assert out["cancelled"] is True
+    assert out["success"] is False
+    assert out["token_usage"]["cost_usd"] == RESULT_EVENT["total_cost_usd"]
+
+
+def test_token_usage_empty_when_timeout_before_first_result_event():
+    """Hard fast-fail timeout (no result event ever emitted) → no
+    cost recorded. Honest $0 is the right answer here; the fix only
+    recovers cost that the CLI actually reported."""
+    out = _drive_invocation(stdout="", timed_out=True, returncode=-1)
+    assert out["timed_out"] is True
+    assert out["token_usage"] == {}
+
+
+def test_token_usage_recovered_with_partial_ndjson_on_timeout():
+    """Realistic timeout shape — the CLI managed two compaction
+    boundaries before SIGKILL, so two ``result`` events landed in
+    stdout. ``_summarize_results`` aggregates correctly: per-batch
+    fields summed, cumulative cost from the latest event."""
+    earlier = {**RESULT_EVENT, "total_cost_usd": 0.10, "session_id": "earlier"}
+    later = {**RESULT_EVENT, "total_cost_usd": 0.55, "session_id": "later"}
+    ndjson = "\n".join([json.dumps(earlier), json.dumps(later)])
+    out = _drive_invocation(stdout=ndjson, timed_out=True, returncode=-1)
+    # Cumulative — last event wins, not summed.
+    assert out["token_usage"]["cost_usd"] == pytest.approx(0.55)
+    # Per-batch fields summed.
+    assert out["token_usage"]["input_tokens"] == RESULT_EVENT["usage"]["input_tokens"] * 2
+
+
+def test_token_usage_empty_on_subprocess_exception():
+    """Pre-spawn failure (e.g. ``FileNotFoundError`` on ``cmd[0]``).
+    No process ever ran, so empty token_usage stays correct — this
+    test documents the contract for the fourth return path."""
+    iface = _make_interface("json")
+    with patch("utils.claude_interface.run_with_cancel", side_effect=FileNotFoundError("claude not found")):
+        out = iface._single_invocation("prompt", "/tmp", model=None)
+    assert out["success"] is False
+    assert out["token_usage"] == {}
+
+
+def test_token_usage_unchanged_on_success():
+    """Regression guard: the success path still produces the same
+    ``token_usage`` dict it did before the refactor."""
+    out = _drive_invocation(stdout=json.dumps(RESULT_EVENT), returncode=0)
+    assert out["success"] is True
+    assert out["token_usage"]["cost_usd"] == RESULT_EVENT["total_cost_usd"]
+    assert out["token_usage"]["input_tokens"] == RESULT_EVENT["usage"]["input_tokens"]
+    assert out["token_usage"]["output_tokens"] == RESULT_EVENT["usage"]["output_tokens"]
+    assert out["token_usage"]["cache_creation_tokens"] == RESULT_EVENT["usage"]["cache_creation_input_tokens"]
+    assert out["token_usage"]["cache_read_tokens"] == RESULT_EVENT["usage"]["cache_read_input_tokens"]
+    assert out["token_usage"]["num_turns"] == RESULT_EVENT["num_turns"]
+    assert out["token_usage"]["duration_ms"] == RESULT_EVENT["duration_ms"]
+    assert out["token_usage"]["session_id"] == RESULT_EVENT["session_id"]

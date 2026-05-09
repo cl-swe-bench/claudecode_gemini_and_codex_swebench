@@ -181,6 +181,9 @@ class ClaudeCodeInterface:
                 is_cancelled=self.is_cancelled,
             )
         except Exception as e:
+            # No stdout available — process management itself failed
+            # (FileNotFoundError on ``cmd[0]``, etc.). Empty token usage
+            # is honest here.
             return {
                 "success": False,
                 "stdout": "",
@@ -190,94 +193,111 @@ class ClaudeCodeInterface:
             }
 
         if result.timed_out:
+            # 30-minute hardcap. ``run_with_cancel`` stashed the partial
+            # NDJSON stream the CLI emitted before SIGKILL; parse it so
+            # cumulative cost from prior turns lands in ``token_usage``.
+            # Without this we systematically under-bill timed-out
+            # samples (the previous bug — ran 30 min, recorded $0).
             return {
                 "success": False,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "returncode": -1,
-                "token_usage": {},
+                "token_usage": self._extract_token_usage(result.stdout),
                 "timed_out": True,
             }
 
         if result.cancelled:
             # Surface the cancel flag all the way up — with_rate_limit_retry
-            # + process_instance + run_shard all key off it.
+            # + process_instance + run_shard all key off it. Same partial-
+            # stdout parsing as the timeout path: cancels can fire
+            # mid-session with real spend already incurred.
             return {
                 "success": False,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "returncode": result.returncode,
-                "token_usage": {},
+                "token_usage": self._extract_token_usage(result.stdout),
                 "cancelled": True,
             }
-
-        # Parse output for token usage and metadata.
-        #
-        # The result event shape (shared between ``json`` and ``stream-json``
-        # output formats) is:
-        # {
-        #   "type": "result", "result": "...",
-        #   "num_turns": N, "duration_ms": N, "duration_api_ms": N,
-        #   "is_error": bool, "session_id": "...",
-        #   "total_cost_usd": N.NN,
-        #   "usage": { "input_tokens": N, "output_tokens": N,
-        #              "cache_creation_input_tokens": N, "cache_read_input_tokens": N },
-        #   "modelUsage": { "<model-id>": {inputTokens, outputTokens,
-        #                                  cacheCreationInputTokens,
-        #                                  cacheReadInputTokens, costUSD, ...},
-        #                   ... }   # cumulative per-model totals
-        # }
-        #
-        # ``json`` emits the final result event as a single stdout blob.
-        # ``stream-json`` may emit ONE OR MORE result events as NDJSON
-        # — recent CLI versions split the stream at compaction or
-        # session-resume boundaries. ``_summarize_results`` walks every
-        # result event and aggregates them into one summary dict so
-        # downstream code sees a single canonical shape regardless of
-        # how many batches the CLI actually emitted.
-        #
-        # Aggregation rules:
-        #   - per-batch fields (``duration_ms``, ``num_turns``,
-        #     ``usage.{input,output,cache_*}_tokens``) → SUM across events
-        #   - cumulative fields (``total_cost_usd``, ``duration_api_ms``,
-        #     ``session_id``, ``modelUsage``) → take from last event
-        token_usage = {}
-        if result.stdout:
-            summary = self._summarize_results(result.stdout)
-            if summary:
-                usage = summary.get("usage") or {}
-                input_tokens = usage.get("input_tokens", 0)
-                output_tokens = usage.get("output_tokens", 0)
-                token_usage = {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
-                    "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
-                    "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
-                }
-                if summary.get("total_cost_usd") is not None:
-                    token_usage["cost_usd"] = summary["total_cost_usd"]
-                if summary.get("num_turns") is not None:
-                    token_usage["num_turns"] = summary["num_turns"]
-                if summary.get("duration_ms") is not None:
-                    token_usage["duration_ms"] = summary["duration_ms"]
-                if summary.get("duration_api_ms") is not None:
-                    token_usage["duration_api_ms"] = summary["duration_api_ms"]
-                if summary.get("session_id") is not None:
-                    token_usage["session_id"] = summary["session_id"]
-                # Per-model breakdown — cumulative across all batches +
-                # all models the CLI invoked (main agent + Task subagents).
-                # Empty dict on older CLIs that don't emit ``modelUsage``.
-                if summary.get("modelUsage"):
-                    token_usage["model_usage"] = summary["modelUsage"]
 
         return {
             "success": result.returncode == 0,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
-            "token_usage": token_usage,
+            "token_usage": self._extract_token_usage(result.stdout),
         }
+
+    def _extract_token_usage(self, stdout: str) -> Dict[str, Any]:
+        """Aggregate ``type=result`` events in ``stdout`` into the
+        cl-benchmark library token-usage schema.
+
+        Called from every ``execute_code_cli`` return path — success,
+        timeout, cancelled, exception. Timeouts in particular emit
+        partial NDJSON with cumulative cost from prior turns; the
+        success path used to be the only caller, which silently
+        under-billed every 30-min timed-out sample by the full
+        accumulated cost (~$5-15/sample empirically).
+
+        Returns ``{}`` when stdout is empty or contains no result
+        events (older CLI versions, hard fast-fail before any model
+        call, etc.).
+
+        The result event shape (same in ``json`` + ``stream-json``):
+
+            {
+              "type": "result", "result": "...",
+              "num_turns": N, "duration_ms": N, "duration_api_ms": N,
+              "is_error": bool, "session_id": "...",
+              "total_cost_usd": N.NN,
+              "usage": {
+                "input_tokens": N, "output_tokens": N,
+                "cache_creation_input_tokens": N,
+                "cache_read_input_tokens": N
+              },
+              "modelUsage": { "<model-id>": {...}, ... }
+            }
+
+        ``json`` emits the final event as a single blob; ``stream-json``
+        may emit one or more result events as NDJSON (CLI splits at
+        compaction / session-resume boundaries). ``_summarize_results``
+        walks every event and aggregates per-batch fields (token
+        counts, ``duration_ms``, ``num_turns``) by SUM and cumulative
+        fields (``total_cost_usd``, ``session_id``, ``modelUsage``)
+        from the last event.
+        """
+        if not stdout:
+            return {}
+        summary = self._summarize_results(stdout)
+        if not summary:
+            return {}
+        usage = summary.get("usage") or {}
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        token_usage: Dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
+            "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
+        }
+        if summary.get("total_cost_usd") is not None:
+            token_usage["cost_usd"] = summary["total_cost_usd"]
+        if summary.get("num_turns") is not None:
+            token_usage["num_turns"] = summary["num_turns"]
+        if summary.get("duration_ms") is not None:
+            token_usage["duration_ms"] = summary["duration_ms"]
+        if summary.get("duration_api_ms") is not None:
+            token_usage["duration_api_ms"] = summary["duration_api_ms"]
+        if summary.get("session_id") is not None:
+            token_usage["session_id"] = summary["session_id"]
+        # Per-model breakdown — cumulative across all batches + all
+        # models the CLI invoked (main agent + Task subagents). Empty
+        # dict on older CLIs that don't emit ``modelUsage``.
+        if summary.get("modelUsage"):
+            token_usage["model_usage"] = summary["modelUsage"]
+        return token_usage
 
     def _summarize_results(self, stdout: str) -> Dict[str, Any]:
         """Aggregate every ``type=result`` event in stdout into a single
