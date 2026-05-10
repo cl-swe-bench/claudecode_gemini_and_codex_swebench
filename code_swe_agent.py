@@ -4,8 +4,10 @@ SWE-bench agent capable of using Claude Code or Codex backends.
 """
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import sys
 import subprocess
 import tempfile
@@ -33,6 +35,74 @@ from utils.mcp_config import (
 
 
 DEFAULT_BACKEND = os.environ.get("CODE_SWE_BACKEND", "claude")
+
+
+# Wall-clock budget for the pre-CLI setup phase (git clone, git stash,
+# MCP injection, prompt formatting). Default 600s = 10 min. Long
+# enough for any reasonable SWE-bench Pro repo's initial clone +
+# checkout; short enough to fail-fast when a clone wedges.
+#
+# Pre-2026-05-10 the setup phase had no timeout; the existing
+# ``subprocess_timeout_s`` covers only the post-spawn CLI wait
+# (see ``utils/cancellable_subprocess.py``). A hang in setup (e.g.
+# a multi-GB clone of protonmail/webclients deadlocked on a network
+# stall) sat indefinitely until something else killed the worker.
+# This budget catches the hang and emits the same
+# ``timed_out=True`` result shape as a CLI timeout so the
+# cl-benchmark worker produces an honest ``instance.error: timeout``
+# event. Set to 0 to disable. See
+# cl-benchmark/docs/stuck-sample-recovery-spec.md.
+SETUP_TIMEOUT_S = int(os.environ.get("SETUP_TIMEOUT_S", "600"))
+
+
+class SetupTimeoutError(Exception):
+    """Setup phase exceeded its wall-clock budget. Caught at the
+    ``process_instance`` boundary; emits a ``timed_out=True`` result
+    dict so the cl-benchmark worker treats it like a CLI-side timeout.
+    """
+
+
+@contextlib.contextmanager
+def _setup_timeout(timeout_s: int):
+    """Wall-clock budget for the pre-CLI setup phase. POSIX-only
+    (project is mac/linux only — same constraint as
+    ``cancellable_subprocess``).
+
+    Uses ``signal.SIGALRM`` so even a blocking ``subprocess.run`` call
+    inside the setup window gets interrupted when the budget expires.
+    Python's PEP 475 retry-on-EINTR is bypassed when the signal
+    handler raises — so the ``SetupTimeoutError`` propagates cleanly.
+
+    Set ``timeout_s=0`` to disable. Signal handler installation
+    requires running in the main thread (Python constraint); the
+    worker's job-execution path runs there, so this is safe in
+    production. Falls back to no-timeout if not in the main thread
+    (defensive — keeps standalone-CLI callers working in any thread).
+    """
+    if timeout_s <= 0:
+        yield
+        return
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        # Can't install signal handlers off the main thread. Skip
+        # the budget rather than crash — happens for direct unit-test
+        # invocation of process_instance.
+        yield
+        return
+
+    def _handler(_signum, _frame):
+        raise SetupTimeoutError(
+            f"setup phase timed out after {timeout_s} seconds"
+        )
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout_s)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def _projects_dir() -> Path:
@@ -411,23 +481,94 @@ class CodeSWEAgent:
             "formatted_prompt": None,
         }
 
-        repo_path, setup_stdout, setup_stderr = self.setup_repository(
-            instance, cwd_suffix=cwd_suffix
-        )
-        # Snapshot ``$HOME/.claude/projects/`` BEFORE invoking claude-code
-        # so the finally block can rm any directory the CLI created during
-        # this instance. Closes the project-memory contamination channel
-        # documented in cl-benchmark/docs/cross-instance-contamination-analysis.md
-        # without depending on knowing the CLI's path-encoding scheme.
-        # Path.home() picks up cl-benchmark's per-shard HOME relocation
-        # for api_key runs and the host HOME for Max runs — correct in
-        # both cases.
-        projects_before = _snapshot_projects_dir()
+        # ---- pre-CLI setup phase: bounded by ``SETUP_TIMEOUT_S`` ----
+        #
+        # Pre-2026-05-10 the setup phase had no timeout — a hung git
+        # clone or MCP indexer could keep a shard pinned indefinitely,
+        # producing no events and bypassing the post-spawn CLI timeout.
+        # We wrap the window from ``setup_repository`` through the
+        # final pre-CLI write in a wall-clock budget; on expiry we
+        # return the same ``timed_out=True`` shape as a CLI-side
+        # timeout, so cl-benchmark's worker emits the usual
+        # ``instance.error: timeout`` event. See
+        # cl-benchmark/docs/stuck-sample-recovery-spec.md.
+        setup_stdout = ""
+        setup_stderr = ""
+        repo_path: Optional[str] = None
+        projects_before: set[str] = set()
+        try:
+            with _setup_timeout(SETUP_TIMEOUT_S):
+                repo_path, setup_stdout, setup_stderr = self.setup_repository(
+                    instance, cwd_suffix=cwd_suffix
+                )
+                # Snapshot ``$HOME/.claude/projects/`` BEFORE invoking
+                # claude-code so the finally block can rm any directory
+                # the CLI created during this instance. Closes the
+                # project-memory contamination channel documented in
+                # cl-benchmark/docs/cross-instance-contamination-analysis.md
+                # without depending on knowing the CLI's path-encoding
+                # scheme. Path.home() picks up cl-benchmark's per-shard
+                # HOME relocation for api_key runs and the host HOME
+                # for Max runs — correct in both cases.
+                projects_before = _snapshot_projects_dir()
+
+                if repo_path is not None:
+                    os.chdir(repo_path)
+                    subprocess.run(["git", "add", "-A"], capture_output=True)
+                    subprocess.run(["git", "stash"], capture_output=True)
+
+                    # Resolve the repo's git remote URL post-stash for use
+                    # as the Code Lexica MCP ``repoIdentifier``. Substituted
+                    # into the nudged prompt template + the CLAUDE.md
+                    # section. Falls back to the inferred GitHub URL if
+                    # origin isn't set (defensive — SWE-bench clones
+                    # always have origin).
+                    repo_identifier = _resolve_repo_identifier(
+                        repo_path, fallback_repo=instance.get("repo", "")
+                    )
+                    self.prompt_formatter.repo_identifier = repo_identifier
+
+                    # Pass the actual cloned path so the prompt's ``Base
+                    # directory:`` line matches the agent's real cwd —
+                    # matters whenever ``cwd_suffix`` is set.
+                    prompt = self.prompt_formatter.format_for_cli(
+                        instance, base_path=str(repo_path)
+                    )
+                    task_context["formatted_prompt"] = prompt
+
+                    # Inject ``.mcp.json`` and ``CLAUDE.md`` AFTER the
+                    # ``git add -A`` + ``git stash`` cleanup. The stash
+                    # hides any retry-leftover working-tree modifications,
+                    # and ``-A`` would have staged both files too —
+                    # writing them before the stash silently swept them
+                    # away (same bug pattern that previously caused
+                    # ``mcp_servers: []`` in transcripts). Spec:
+                    # cl-benchmark/docs/mcp-priming-spec.md.
+                    if self.mcp_enabled and self.mcp_manager:
+                        self.mcp_manager.inject_mcp_json(instance_id, repo_path)
+                        inject_claude_md_section(repo_path, repo_identifier)
+                    else:
+                        McpConfigManager.remove_mcp_json(repo_path)
+                        remove_claude_md_section(repo_path)
+        except SetupTimeoutError as e:
+            os.chdir(original_dir)
+            msg = f"Execution failed: {e}"
+            return {
+                "instance_id": instance_id,
+                "model": self.model_alias or f"{self.backend}-code",
+                "prediction": "",
+                "error": msg,
+                "token_usage": {},
+                "timed_out": True,
+                "raw_stdout": "",
+                "raw_stderr": msg,
+                "setup_stdout": setup_stdout,
+                "setup_stderr": (setup_stderr + "\n" + msg) if setup_stderr else msg,
+                **task_context,
+            }
+
         # Slice C: setup-phase streams travel on their own keys so the
         # UI's Setup tab can render them distinctly from CLI output.
-        # Included on every return path so the Setup tab has something
-        # to show even on happy runs (git clone progress is often non-
-        # empty and occasionally useful for "why did clone take so long").
         setup_streams = {
             "setup_stdout": setup_stdout,
             "setup_stderr": setup_stderr,
@@ -458,48 +599,6 @@ class CodeSWEAgent:
             }
 
         try:
-            os.chdir(repo_path)
-            subprocess.run(["git", "add", "-A"], capture_output=True)
-            subprocess.run(["git", "stash"], capture_output=True)
-
-            # Resolve the repo's git remote URL post-stash for use as the
-            # Code Lexica MCP ``repoIdentifier``. Substituted into the
-            # nudged prompt template + the CLAUDE.md section, and saves
-            # the agent a discovery round-trip. Falls back to the inferred
-            # GitHub URL if origin isn't set (defensive — SWE-bench
-            # clones always have origin).
-            repo_identifier = _resolve_repo_identifier(
-                repo_path, fallback_repo=instance.get("repo", "")
-            )
-            self.prompt_formatter.repo_identifier = repo_identifier
-
-            # Pass the actual cloned path so the prompt's ``Base
-            # directory:`` line matches the agent's real cwd — matters
-            # whenever ``cwd_suffix`` is set.
-            prompt = self.prompt_formatter.format_for_cli(
-                instance, base_path=str(repo_path)
-            )
-            # Capture the prompt bytes we actually sent. The formatter
-            # already merged the template + issue + hints; this is what
-            # the CLI reads from stdin.
-            task_context["formatted_prompt"] = prompt
-
-            # Inject ``.mcp.json`` and ``CLAUDE.md`` AFTER the
-            # ``git add -A`` + ``git stash`` cleanup. The stash hides
-            # any retry-leftover working-tree modifications, and ``-A``
-            # would have staged both files too — writing them before
-            # the stash silently swept them away, which is the same
-            # bug pattern that previously caused ``mcp_servers: []``
-            # in transcripts. Writing post-stash keeps both files on
-            # disk + untracked for the duration of the agent run.
-            # Spec: cl-benchmark/docs/mcp-priming-spec.md.
-            if self.mcp_enabled and self.mcp_manager:
-                self.mcp_manager.inject_mcp_json(instance_id, repo_path)
-                inject_claude_md_section(repo_path, repo_identifier)
-            else:
-                McpConfigManager.remove_mcp_json(repo_path)
-                remove_claude_md_section(repo_path)
-
             model_info = f" with model {self.model_alias}" if self.model else ""
             print(f"Running {self.backend.title()} Code{model_info}...")
             result = self.interface.execute_code_cli(
