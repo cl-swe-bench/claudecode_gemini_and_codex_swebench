@@ -271,7 +271,15 @@ class ClaudeCodeInterface:
             return {}
         summary = self._summarize_results(stdout)
         if not summary:
-            return {}
+            # No ``type=result`` events parsed. This is the long-agentic-
+            # loop-timeout case: the CLI was SIGKILLed at 1800s before
+            # ever reaching a compaction boundary or final result, so
+            # ``_summarize_results`` has nothing to work with. Fall
+            # back to walking per-turn ``type=assistant`` events for
+            # token counts — the worker's ``compute_total_cost_usd``
+            # then derives cost from tokens × list price. See
+            # cl-benchmark/docs/post-regen-eval-spec.md.
+            return self._extract_token_usage_from_assistant_events(stdout)
         usage = summary.get("usage") or {}
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
@@ -298,6 +306,81 @@ class ClaudeCodeInterface:
         if summary.get("modelUsage"):
             token_usage["model_usage"] = summary["modelUsage"]
         return token_usage
+
+    def _extract_token_usage_from_assistant_events(
+        self, stdout: str
+    ) -> Dict[str, Any]:
+        """Fallback when no ``type=result`` events are present.
+
+        Walks stream-json for ``type=assistant`` events and sums their
+        ``message.usage`` fields. Each turn emits one assistant event
+        with cumulative-up-to-now or per-turn token counts (depending
+        on the CLI version — both shapes work because we just sum
+        across events, and the consumer's ``compute_total_cost_usd``
+        uses these as totals).
+
+        Used for the long-agentic-loop timeout case: CLI ran for the
+        full 1800s, never reached a compaction / final result, but
+        emitted assistant events per turn. Without this fallback we
+        record ``cost=$0`` for samples that actually burned $10+ of
+        API time. Spec: cl-benchmark/docs/post-regen-eval-spec.md.
+
+        Returns ``{}`` when stdout has no parseable assistant events
+        either (CLI died before any model call, etc.).
+        """
+        if not stdout:
+            return {}
+        usage_sums = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        turn_count = 0
+        # Both ``json`` and ``stream-json`` modes can land here. For
+        # ``json`` mode the CLI emits a single blob — if it had any
+        # assistant context we'd have already captured it via the
+        # result event; landing here for json mode is unusual but
+        # handled (parse as single object).
+        if self.output_format == "json":
+            try:
+                obj = json.loads(stdout.strip())
+            except (json.JSONDecodeError, ValueError):
+                return {}
+            candidates = [obj] if isinstance(obj, dict) else []
+        else:
+            candidates = []
+            for line in stdout.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    candidates.append(json.loads(s))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        for ev in candidates:
+            if not isinstance(ev, dict) or ev.get("type") != "assistant":
+                continue
+            message = ev.get("message") or {}
+            usage = message.get("usage") or {}
+            if not usage:
+                continue
+            turn_count += 1
+            for k in usage_sums:
+                usage_sums[k] += int(usage.get(k) or 0)
+        if turn_count == 0:
+            return {}
+        # Don't populate cost_usd — leave it for the worker's
+        # ``compute_total_cost_usd`` formula path. Same for
+        # duration_ms (no source without a result event).
+        return {
+            "input_tokens": usage_sums["input_tokens"],
+            "output_tokens": usage_sums["output_tokens"],
+            "total_tokens": usage_sums["input_tokens"] + usage_sums["output_tokens"],
+            "cache_creation_tokens": usage_sums["cache_creation_input_tokens"],
+            "cache_read_tokens": usage_sums["cache_read_input_tokens"],
+            "num_turns": turn_count,
+        }
 
     def _summarize_results(self, stdout: str) -> Dict[str, Any]:
         """Aggregate every ``type=result`` event in stdout into a single

@@ -459,3 +459,119 @@ def test_token_usage_unchanged_on_success():
     assert out["token_usage"]["num_turns"] == RESULT_EVENT["num_turns"]
     assert out["token_usage"]["duration_ms"] == RESULT_EVENT["duration_ms"]
     assert out["token_usage"]["session_id"] == RESULT_EVENT["session_id"]
+
+
+# ---------- Fallback to assistant-event tokens -----------------------------
+#
+# Long agentic loops that get SIGKILLed at 1800s sometimes never reach a
+# compaction or final ``result`` event. The 2026-05-09 partial-stdout
+# recovery has nothing to parse in that case and would have returned
+# ``cost=$0``. The fallback walks ``type=assistant`` events for token
+# counts; the cl-benchmark worker's ``compute_total_cost_usd`` then
+# derives cost from list price.
+
+_ASSISTANT_EVENT_TEMPLATE = {
+    "type": "assistant",
+    "message": {
+        "id": "msg_abc",
+        "model": "claude-opus-4-7",
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 250,
+            "cache_creation_input_tokens": 50,
+            "cache_read_input_tokens": 1000,
+        },
+        "content": [],
+    },
+}
+
+
+def test_extract_token_usage_falls_back_to_assistant_events():
+    """No ``result`` events in stream-json → walk ``assistant`` events
+    and sum their usage. Captures the long-timeout case where 34
+    minutes of agentic work emitted no compaction boundary."""
+    iface = _make_interface("stream-json")
+    ndjson = "\n".join(
+        [
+            json.dumps({"type": "system", "session_id": "s"}),
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+            json.dumps({"type": "user", "message": "tool_result..."}),
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+        ]
+    )
+    out = iface._extract_token_usage(ndjson)
+    # 3 assistant events × {100, 250, 50, 1000} per-turn tokens.
+    assert out["input_tokens"] == 300
+    assert out["output_tokens"] == 750
+    assert out["cache_creation_tokens"] == 150
+    assert out["cache_read_tokens"] == 3000
+    assert out["num_turns"] == 3
+    # No cost / duration — let the worker formula handle those.
+    assert "cost_usd" not in out
+    assert "duration_ms" not in out
+
+
+def test_extract_token_usage_prefers_result_events_over_fallback():
+    """When both ``result`` and ``assistant`` events are present, the
+    ``result``-event path wins — we trust the harness-computed
+    cumulative cost over list-price recomputation from sums."""
+    iface = _make_interface("stream-json")
+    ndjson = "\n".join(
+        [
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+            json.dumps(RESULT_EVENT),  # Has total_cost_usd
+        ]
+    )
+    out = iface._extract_token_usage(ndjson)
+    # Cost comes from the result event, not derived from tokens.
+    assert out["cost_usd"] == RESULT_EVENT["total_cost_usd"]
+    # Tokens come from the result event's ``usage``, NOT from summing
+    # the assistant events. (Result-event aggregation is the trusted
+    # path; assistant fallback only fires when result events absent.)
+    assert out["input_tokens"] == RESULT_EVENT["usage"]["input_tokens"]
+
+
+def test_extract_token_usage_empty_when_no_events_at_all():
+    """Stdout with no result AND no assistant events → empty dict.
+    Captures the hard fast-fail case (CLI died before any model
+    call). Honest $0 is the right answer here."""
+    iface = _make_interface("stream-json")
+    ndjson = "\n".join(
+        [
+            json.dumps({"type": "system", "session_id": "s"}),
+            json.dumps({"type": "user", "message": "..."}),
+        ]
+    )
+    assert iface._extract_token_usage(ndjson) == {}
+
+
+def test_assistant_fallback_handles_malformed_lines():
+    """A bad line mid-stream shouldn't kill the fallback walk."""
+    iface = _make_interface("stream-json")
+    ndjson = "\n".join(
+        [
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+            "this is not json",
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+        ]
+    )
+    out = iface._extract_token_usage_from_assistant_events(ndjson)
+    assert out["num_turns"] == 2
+    assert out["input_tokens"] == 200
+
+
+def test_assistant_fallback_skips_assistant_events_without_usage():
+    """Defensive: an assistant event without ``message.usage``
+    shouldn't count as a turn."""
+    iface = _make_interface("stream-json")
+    bare = {"type": "assistant", "message": {"id": "x", "content": []}}
+    ndjson = "\n".join(
+        [
+            json.dumps(bare),
+            json.dumps(_ASSISTANT_EVENT_TEMPLATE),
+        ]
+    )
+    out = iface._extract_token_usage_from_assistant_events(ndjson)
+    assert out["num_turns"] == 1
