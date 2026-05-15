@@ -211,7 +211,9 @@ class CodeSWEAgent:
                  on_rate_limit_retry: Optional[Callable[[Any], None]] = None,
                  is_cancelled: Optional[Callable[[], bool]] = None,
                  output_format: str = "json",
-                 mcp_prompt_nudge: bool = False):
+                 mcp_prompt_nudge: bool = False,
+                 mcp_debug: bool = False,
+                 mcp_url_override: Optional[str] = None):
         # env_overrides + on_rate_limit_retry are Phase 4 additions. The
         # worker plumbs per-shard env + a structlog-emitting callback; the
         # standalone CLI leaves both at None and the behaviour is
@@ -248,6 +250,7 @@ class CodeSWEAgent:
                 on_rate_limit_retry=on_rate_limit_retry,
                 is_cancelled=is_cancelled,
                 output_format=output_format,
+                mcp_debug=mcp_debug,
             )
 
         # ``mcp_prompt_nudge`` only takes effect on the claude backend
@@ -274,10 +277,20 @@ class CodeSWEAgent:
         self.mcp_enabled = mcp_enabled
         self.mcp_manager = None
         if mcp_enabled or mcp_repos_only:
-            self.mcp_manager = McpConfigManager(registry_path=mcp_config_path) if mcp_config_path \
-                else McpConfigManager()
+            self.mcp_manager = McpConfigManager(
+                registry_path=mcp_config_path,
+                mcp_url_override=mcp_url_override,
+            ) if mcp_config_path else McpConfigManager(
+                mcp_url_override=mcp_url_override,
+            )
             if mcp_enabled:
-                print("MCP mode enabled — Code Lexica context will be injected per repo")
+                if mcp_url_override:
+                    print(
+                        f"MCP mode enabled — Code Lexica context will be injected per repo "
+                        f"(endpoint override: {mcp_url_override})"
+                    )
+                else:
+                    print("MCP mode enabled — Code Lexica context will be injected per repo")
 
         # Repo filtering
         self.repos_filter = None
@@ -619,6 +632,11 @@ class CodeSWEAgent:
                     "raw_stdout": result.get("stdout", "") or "",
                     "raw_stderr": result.get("stderr", "") or "",
                     "timed_out": bool(result.get("timed_out")),
+                    # Surface ``--debug-file`` contents when the
+                    # claude interface captured them (mcp_debug=True
+                    # on the run). None on the json/codex/gemini path
+                    # or when the CLI didn't write the file.
+                    "mcp_debug_log": result.get("mcp_debug_log"),
                     **setup_streams,
                     **task_context,
                 }
@@ -637,6 +655,10 @@ class CodeSWEAgent:
             prediction["token_usage"] = token_usage
             prediction["raw_stdout"] = result.get("stdout", "") or ""
             prediction["raw_stderr"] = result.get("stderr", "") or ""
+            # MCP debug log — populated when the claude interface
+            # captured ``--debug-file`` output. None on
+            # capture_mcp_debug=False runs and on codex/gemini.
+            prediction["mcp_debug_log"] = result.get("mcp_debug_log")
             prediction.update(setup_streams)
             prediction.update(task_context)
 
@@ -842,6 +864,8 @@ def run_shard(
     is_cancelled: Optional[Callable[[], bool]] = None,
     output_format: str = "json",
     mcp_prompt_nudge: bool = False,
+    mcp_debug: bool = False,
+    mcp_url_override: Optional[str] = None,
     cwd_suffix: Optional[str] = None,
 ) -> List[Any]:
     """Shardable library entry point used by the cl-benchmark worker.
@@ -896,6 +920,8 @@ def run_shard(
         is_cancelled=is_cancelled,
         output_format=output_format,
         mcp_prompt_nudge=mcp_prompt_nudge,
+        mcp_debug=mcp_debug,
+        mcp_url_override=mcp_url_override,
     )
 
     dataset = load_dataset(dataset_name, revision=dataset_revision, split="test")
@@ -1046,6 +1072,12 @@ def run_shard(
             # "setup ran with no output" from "pre-migration row".
             setup_stdout=prediction.get("setup_stdout", "") or "",
             setup_stderr=prediction.get("setup_stderr", "") or "",
+            # ``--debug-file`` contents from the claude interface, if
+            # ``mcp_debug=True`` and the CLI wrote a non-empty file.
+            # None on every other path (codex/gemini, debug-off, or
+            # CLI crash before debug-mode init). The worker uploads
+            # this to S3 when present.
+            mcp_debug_log=prediction.get("mcp_debug_log"),
         )
         results.append(result)
 

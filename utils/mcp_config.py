@@ -9,11 +9,20 @@ from typing import Optional
 class McpConfigManager:
     """Manages per-repo MCP token resolution and .mcp.json injection."""
 
-    def __init__(self, registry_path: str = None):
+    def __init__(
+        self,
+        registry_path: str = None,
+        mcp_url_override: Optional[str] = None,
+    ):
         if registry_path is None:
             # Default to configs/code_lexica_repos.json relative to project root
             registry_path = Path(__file__).parent.parent / "configs" / "code_lexica_repos.json"
         self.registry = self._load_registry(registry_path)
+        # When set, beats ``registry["mcp_url"]`` in ``inject_mcp_json``.
+        # cl-benchmark uses this to support per-run MCP endpoint overrides
+        # (e.g. pinning a benchmark run to ``…/mcp/v3``) without mutating
+        # the shared registry file.
+        self.mcp_url_override = mcp_url_override
 
     def _load_registry(self, path) -> dict:
         p = Path(path)
@@ -142,7 +151,7 @@ class McpConfigManager:
             "mcpServers": {
                 "code-lexica": {
                     "type": "http",
-                    "url": self.registry["mcp_url"],
+                    "url": self.mcp_url_override or self.registry["mcp_url"],
                     "headers": {
                         "Authorization": f"Bearer {token}"
                     },

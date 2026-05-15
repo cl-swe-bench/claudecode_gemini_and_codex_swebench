@@ -37,6 +37,7 @@ class ClaudeCodeInterface:
         on_rate_limit_retry: Optional[Callable[[RateLimitEvent], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
         output_format: OutputFormat = "json",
+        mcp_debug: bool = False,
     ):
         """Ensure the Claude CLI is available on the system.
 
@@ -68,6 +69,17 @@ class ClaudeCodeInterface:
                 visibility. Both formats share an identical final
                 ``result`` event so token + cost extraction is
                 format-invariant.
+            mcp_debug: When True, appends ``--debug-file <cwd>/
+                mcp-debug.log`` to the CLI invocation. The CLI writes
+                its full debug stream (connection lifecycle,
+                ``tool_dispatch_start``/``end``, MCP timeout cause
+                lines, etc.) to that file. We read it back after the
+                subprocess exits and return contents via
+                ``result["mcp_debug_log"]``; the file is then deleted.
+                cl-benchmark workers pass this when the run has
+                ``capture_mcp_debug=True``. Independent of
+                ``output_format``. See
+                ``cl-benchmark/docs/mcp-debug-capture-spec.md``.
         """
         if output_format not in ("json", "stream-json"):
             raise ValueError(
@@ -79,6 +91,7 @@ class ClaudeCodeInterface:
         self.on_rate_limit_retry = on_rate_limit_retry
         self.is_cancelled = is_cancelled
         self.output_format = output_format
+        self.mcp_debug = mcp_debug
         self._detector = ClaudeRateLimitDetector()
         try:
             result = subprocess.run([
@@ -157,6 +170,18 @@ class ClaudeCodeInterface:
         mcp_path = os.path.join(cwd, ".mcp.json")
         if os.path.isfile(mcp_path):
             cmd.extend(["--mcp-config", mcp_path, "--strict-mcp-config"])
+        # MCP debug capture: writes the full ``--debug`` stream
+        # (connection lifecycle, ``tool_dispatch_start``/``end``,
+        # MCP timeout causes, heartbeats) to a sibling file. cl-bench
+        # workers set this when ``run.capture_mcp_debug=True``. We
+        # also implicitly enable debug mode by passing ``--debug-file``
+        # — no separate ``--debug`` flag needed (and avoids the
+        # high-volume debug output ending up on stderr, where the
+        # harness collects gen-log content). Read back + return
+        # contents after the CLI exits; see ``_read_and_clean_mcp_debug``.
+        mcp_debug_path = os.path.join(cwd, "mcp-debug.log") if self.mcp_debug else None
+        if mcp_debug_path is not None:
+            cmd.extend(["--debug-file", mcp_debug_path])
         if model:
             cmd.extend(["--model", model])
 
@@ -183,13 +208,15 @@ class ClaudeCodeInterface:
         except Exception as e:
             # No stdout available — process management itself failed
             # (FileNotFoundError on ``cmd[0]``, etc.). Empty token usage
-            # is honest here.
+            # is honest here. Debug log might still exist if the CLI
+            # crashed mid-debug; surface what we have.
             return {
                 "success": False,
                 "stdout": "",
                 "stderr": str(e),
                 "returncode": -1,
                 "token_usage": {},
+                "mcp_debug_log": self._read_and_clean_mcp_debug(mcp_debug_path),
             }
 
         if result.timed_out:
@@ -205,6 +232,7 @@ class ClaudeCodeInterface:
                 "returncode": -1,
                 "token_usage": self._extract_token_usage(result.stdout),
                 "timed_out": True,
+                "mcp_debug_log": self._read_and_clean_mcp_debug(mcp_debug_path),
             }
 
         if result.cancelled:
@@ -219,6 +247,7 @@ class ClaudeCodeInterface:
                 "returncode": result.returncode,
                 "token_usage": self._extract_token_usage(result.stdout),
                 "cancelled": True,
+                "mcp_debug_log": self._read_and_clean_mcp_debug(mcp_debug_path),
             }
 
         return {
@@ -227,7 +256,36 @@ class ClaudeCodeInterface:
             "stderr": result.stderr,
             "returncode": result.returncode,
             "token_usage": self._extract_token_usage(result.stdout),
+            "mcp_debug_log": self._read_and_clean_mcp_debug(mcp_debug_path),
         }
+
+    @staticmethod
+    def _read_and_clean_mcp_debug(path: Optional[str]) -> Optional[str]:
+        """Read the CLI's ``--debug-file`` output, then delete the file.
+
+        Returns the contents as a string when the file exists + is
+        non-empty. Returns ``None`` when the path is None (caller
+        didn't ask for debug capture), the file is missing (CLI
+        crashed before debug-mode init, or earlier — e.g.,
+        FileNotFoundError on the ``claude`` binary), or empty.
+
+        Always attempts the unlink afterward so per-instance task
+        dirs don't accumulate logs across re-runs in the same cwd.
+        Delete failures are silent — they shouldn't fail the
+        instance.
+        """
+        if path is None or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                body = f.read()
+        except OSError:
+            return None
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return body if body else None
 
     def _extract_token_usage(self, stdout: str) -> Dict[str, Any]:
         """Aggregate ``type=result`` events in ``stdout`` into the
