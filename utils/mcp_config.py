@@ -162,23 +162,27 @@ class McpConfigManager:
                         "relevant to the specific task you are working on. If "
                         "you are working in a git repository, run git remote "
                         "get-url origin and pass the result as the repoIdentifier "
-                        "parameter on all Code Lexica tool calls. ALSO pass the "
-                        "user's task prompt (the issue / feature description "
-                        "you've been asked to work on) as the taskPrompt parameter "
-                        "— this drives the relevance filter; without it you "
-                        "receive an unfocused project overview instead of a "
-                        "task-tailored view. BEFORE exploring the codebase with "
-                        "grep, glob, semantic search, file reads, or explore "
-                        "subagents, call get_codebase_context with both "
-                        "parameters. The response tells you which files / "
-                        "directories are relevant, how they're named, and the "
-                        "conventions that apply, so you can spend many fewer "
-                        "turns exploring. Use the response to direct your "
-                        "subsequent reads and searches — don't ignore it and "
-                        "restart from scratch. Always call get_codebase_context "
-                        "BEFORE delegating to subagents — subagents may not have "
-                        "access to this tool, so fetch the context first and "
-                        "include it in your subagent instructions."
+                        "parameter on all Code Lexica tool calls. ALSO run git "
+                        "rev-parse HEAD and pass the result as the commitHash "
+                        "parameter — this pins the response to the exact "
+                        "codebase state you are working against rather than the "
+                        "latest indexed state. ALSO pass the user's task prompt "
+                        "(the issue / feature description you've been asked to "
+                        "work on) as the taskPrompt parameter — this drives the "
+                        "relevance filter; without it you receive an unfocused "
+                        "project overview instead of a task-tailored view. "
+                        "BEFORE exploring the codebase with grep, glob, semantic "
+                        "search, file reads, or explore subagents, call "
+                        "get_codebase_context with all three parameters. The "
+                        "response tells you which files / directories are "
+                        "relevant, how they're named, and the conventions that "
+                        "apply, so you can spend many fewer turns exploring. Use "
+                        "the response to direct your subsequent reads and "
+                        "searches — don't ignore it and restart from scratch. "
+                        "Always call get_codebase_context BEFORE delegating to "
+                        "subagents — subagents may not have access to this "
+                        "tool, so fetch the context first and include it in "
+                        "your subagent instructions."
                     )
                 }
             }
@@ -225,12 +229,20 @@ def _read_claude_md_template() -> str:
     return _CLAUDE_MD_TEMPLATE_PATH.read_text()
 
 
-def _render_claude_md_section(repo_identifier: str) -> str:
-    """Substitute ``{repo_identifier}`` into the template. The result is
-    a complete, sentinel-wrapped section ready to drop into a CLAUDE.md.
+def _render_claude_md_section(repo_identifier: str, commit_hash: str) -> str:
+    """Substitute ``{repo_identifier}`` and ``{commit_hash}`` into the
+    template. The result is a complete, sentinel-wrapped section ready
+    to drop into a CLAUDE.md. Empty-string ``commit_hash`` substitutes
+    cleanly (the agent can fall back to ``git rev-parse HEAD`` on its
+    own); same shape as the existing ``repo_identifier=""`` fallback.
     """
     template = _read_claude_md_template()
-    return template.replace("{repo_identifier}", repo_identifier).rstrip() + "\n"
+    rendered = (
+        template
+        .replace("{repo_identifier}", repo_identifier)
+        .replace("{commit_hash}", commit_hash)
+    )
+    return rendered.rstrip() + "\n"
 
 
 def _replace_section(existing: str, new_section: str) -> str:
@@ -249,7 +261,9 @@ def _replace_section(existing: str, new_section: str) -> str:
     return existing[:start_idx] + new_section + existing[end_with_marker:]
 
 
-def inject_claude_md_section(task_dir: str, repo_identifier: str) -> Path:
+def inject_claude_md_section(
+    task_dir: str, repo_identifier: str, commit_hash: str = ""
+) -> Path:
     """Write or update the Code Lexica section in ``<task_dir>/CLAUDE.md``.
 
     Behavior:
@@ -259,9 +273,12 @@ def inject_claude_md_section(task_dir: str, repo_identifier: str) -> Path:
       * CLAUDE.md exists without our sentinels → append our section to
         the end with a leading blank line, preserving upstream content.
 
-    Returns the path written. Idempotent across re-runs.
+    ``commit_hash`` defaults to empty for the older two-arg call shape
+    that some standalone-CLI callers still use; cl-benchmark passes the
+    instance's ``base_commit`` explicitly. Returns the path written.
+    Idempotent across re-runs.
     """
-    section = _render_claude_md_section(repo_identifier)
+    section = _render_claude_md_section(repo_identifier, commit_hash)
     claude_md = Path(task_dir) / "CLAUDE.md"
     if not claude_md.exists():
         claude_md.write_text(section)

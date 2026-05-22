@@ -31,17 +31,33 @@ from utils.mcp_config import (  # noqa: E402
 
 
 REPO_ID = "https://github.com/acme/widget.git"
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
 def test_inject_writes_fresh_when_no_claude_md(tmp_path):
-    out = inject_claude_md_section(str(tmp_path), REPO_ID)
+    out = inject_claude_md_section(str(tmp_path), REPO_ID, COMMIT)
     assert out == tmp_path / "CLAUDE.md"
     body = out.read_text()
     assert _CLAUDE_MD_SENTINEL_START in body
     assert _CLAUDE_MD_SENTINEL_END in body
     assert REPO_ID in body
-    # repo_identifier placeholder fully substituted.
+    assert COMMIT in body
+    # Both placeholders fully substituted.
     assert "{repo_identifier}" not in body
+    assert "{commit_hash}" not in body
+
+
+def test_inject_handles_empty_commit_hash(tmp_path):
+    """``commit_hash`` defaults to "" for older two-arg callers; the
+    template must render cleanly with an empty placeholder rather than
+    leaving a literal ``{commit_hash}`` in the body."""
+    inject_claude_md_section(str(tmp_path), REPO_ID)  # two-arg call
+    body = (tmp_path / "CLAUDE.md").read_text()
+    assert "{commit_hash}" not in body
+    # The bullet still renders the backtick-empty marker so the
+    # section structure stays parseable. Pin the substring so a
+    # template refactor that drops the bullet entirely gets caught.
+    assert "`commitHash`:" in body
 
 
 def test_inject_appends_to_upstream_claude_md(tmp_path):

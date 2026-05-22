@@ -398,6 +398,35 @@ def test_nudge_template_handles_missing_repo_identifier():
     assert "{repo_identifier}" not in prompt
 
 
+def test_nudge_template_substitutes_commit_hash():
+    """``commit_hash`` is a required MCP parameter alongside
+    ``repoIdentifier``. The nudge template surfaces it so the agent
+    passes both on every Code Lexica call."""
+    formatter = PromptFormatter(
+        mcp_prompt_nudge=True,
+        repo_identifier="https://github.com/foo/bar.git",
+        commit_hash="0123456789abcdef0123456789abcdef01234567",
+    )
+    prompt = formatter.format_issue(_basic_instance())
+    assert (
+        'commitHash="0123456789abcdef0123456789abcdef01234567"' in prompt
+    )
+    assert "{commit_hash}" not in prompt
+
+
+def test_nudge_template_handles_missing_commit_hash():
+    """Empty commit-hash falls through cleanly (mirror of the
+    missing-repo-identifier fallback). MCP server treats this as
+    'latest indexed state'; the prompt still parses."""
+    formatter = PromptFormatter(
+        mcp_prompt_nudge=True,
+        repo_identifier="https://github.com/foo/bar.git",
+    )
+    prompt = formatter.format_issue(_basic_instance())
+    assert 'commitHash=""' in prompt
+    assert "{commit_hash}" not in prompt
+
+
 def test_nudge_template_byte_for_byte_matches_spec():
     """Strong regression guard for the MCP nudge template's exact
     rendered shape. The opening through the "Your task is to make the
@@ -413,6 +442,7 @@ def test_nudge_template_byte_for_byte_matches_spec():
     formatter = PromptFormatter(
         mcp_prompt_nudge=True,
         repo_identifier="https://github.com/acme/widget.git",
+        commit_hash="0123456789abcdef0123456789abcdef01234567",
     )
     instance = {
         "instance_id": "x",
@@ -447,7 +477,7 @@ def test_nudge_template_byte_for_byte_matches_spec():
         "Codebase context tool (call ONCE per task — share the result, don't re-fetch):\n"
         "  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions, PRE-FILTERED by the server to the parts relevant to your specific task. Tells you which files/directories are relevant + how they're named so you can skip dead-end reads. Call BEFORE any grep/find/Read or before delegating to a subagent.\n"
         "\n"
-        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git" and taskPrompt = the body of the <pr_description> block above (drives the server-side relevance filter; required for a task-tailored response).\n'
+        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git", commitHash="0123456789abcdef0123456789abcdef01234567", and taskPrompt = the body of the <pr_description> block above. The first two pin the response to the exact repo + commit being worked on; taskPrompt drives the server-side relevance filter. All three are required for a task-tailored response.\n'
         "\n"
         "Follow these steps to resolve the issue:\n"
         "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body as taskPrompt so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
