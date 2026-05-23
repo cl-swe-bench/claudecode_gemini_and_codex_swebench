@@ -50,6 +50,7 @@ class PromptFormatter:
         prompt_template_path: Optional[str] = None,
         mcp_prompt_nudge: bool = False,
         repo_identifier: Optional[str] = None,
+        commit_hash: Optional[str] = None,
     ):
         """
         Args:
@@ -64,10 +65,17 @@ class PromptFormatter:
                 ``https://github.com/owner/repo.git``) substituted into the
                 nudged template's ``{repo_identifier}`` placeholder. Inert
                 for the default template, which doesn't reference MCP.
+            commit_hash: Full 40-char base_commit SHA pinned by the dataset
+                row, substituted into the nudged template's
+                ``{commit_hash}`` placeholder. Pins the MCP response to the
+                exact codebase state the agent is operating against.
+                Empty string when unknown — template still parses; the MCP
+                server treats missing commits as "current state".
         """
         self.prompt_template_path = prompt_template_path
         self.mcp_prompt_nudge = mcp_prompt_nudge
         self.repo_identifier = repo_identifier
+        self.commit_hash = commit_hash
         self.base_template = self._load_base_template()
 
     def _load_base_template(self) -> str:
@@ -134,8 +142,9 @@ Your thinking should be thorough and so it's fine if it's very long."""
           and the "Follow these steps to resolve the issue:" line, a
           ``Codebase context tool`` block names the
           ``get_codebase_context`` Code Lexica MCP tool and describes
-          when to call it, followed by the ``repoIdentifier``
-          directive.
+          when to call it, followed by the ``repoIdentifier`` +
+          ``commitHash`` directive (both required parameters that pin
+          the response to the exact repo and commit being worked on).
         * As the new first step in upstream's numbered task list, a
           mandatory ``get_codebase_context`` call (with
           subagent-sharing nudge to avoid redundant re-fetches).
@@ -151,11 +160,12 @@ Your thinking should be thorough and so it's fine if it's very long."""
         tools were surfaced at once, so we narrowed the nudge to the
         single highest-value tool.
 
-        ``{repo_identifier}`` is substituted at format time. cl-benchmark
-        threads the resolved git remote URL down through ``run_shard``;
-        callers without an identifier get an empty string and the prompt
-        still parses (the agent can still call ``git remote get-url
-        origin`` itself). Spec:
+        ``{repo_identifier}`` + ``{commit_hash}`` are substituted at
+        format time. cl-benchmark threads the resolved git remote URL +
+        the dataset row's ``base_commit`` down through ``run_shard``;
+        callers without one get an empty string and the prompt still
+        parses (the agent can still call ``git remote get-url origin``
+        / ``git rev-parse HEAD`` itself). Spec:
         cl-benchmark/docs/mcp-priming-spec.md (Prompt nudge template).
         """
         return """<uploaded_files>
@@ -174,7 +184,7 @@ Your task is to make the minimal changes to non-tests files in the {base_path} d
 Codebase context tool (call ONCE per task — share the result, don't re-fetch):
   - mcp__code-lexica__get_codebase_context — architecture, code map, conventions, PRE-FILTERED by the server to the parts relevant to your specific task. Tells you which files/directories are relevant + how they're named so you can skip dead-end reads. Call BEFORE any grep/find/Read or before delegating to a subagent.
 
-For all Code Lexica calls, pass repoIdentifier="{repo_identifier}" and taskPrompt = the body of the <pr_description> block above (drives the server-side relevance filter; required for a task-tailored response).
+For all Code Lexica calls, pass repoIdentifier="{repo_identifier}", commitHash="{commit_hash}", and taskPrompt = the body of the <pr_description> block above. The first two pin the response to the exact repo + commit being worked on; taskPrompt drives the server-side relevance filter. All three are required for a task-tailored response.
 
 Follow these steps to resolve the issue:
 1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body as taskPrompt so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
@@ -233,6 +243,7 @@ Your thinking should be thorough and so it's fine if it's very long."""
             instance_id=instance_id,
             base_commit=base_commit,
             repo_identifier=self.repo_identifier or "",
+            commit_hash=self.commit_hash or "",
         )
 
         # Add any hints if available

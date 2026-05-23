@@ -539,7 +539,17 @@ class CodeSWEAgent:
                     repo_identifier = _resolve_repo_identifier(
                         repo_path, fallback_repo=instance.get("repo", "")
                     )
+                    # ``commitHash`` is the dataset row's pinned
+                    # base_commit — the clone is checked out at exactly
+                    # this commit by ``setup_repository``, so the dataset
+                    # value is the authoritative source (no need to shell
+                    # out to ``git rev-parse HEAD``). Empty string falls
+                    # through to the template unchanged; the MCP server
+                    # tolerates missing commits by serving the latest
+                    # indexed state.
+                    commit_hash = instance.get("base_commit", "") or ""
                     self.prompt_formatter.repo_identifier = repo_identifier
+                    self.prompt_formatter.commit_hash = commit_hash
 
                     # Pass the actual cloned path so the prompt's ``Base
                     # directory:`` line matches the agent's real cwd —
@@ -559,7 +569,9 @@ class CodeSWEAgent:
                     # cl-benchmark/docs/mcp-priming-spec.md.
                     if self.mcp_enabled and self.mcp_manager:
                         self.mcp_manager.inject_mcp_json(instance_id, repo_path)
-                        inject_claude_md_section(repo_path, repo_identifier)
+                        inject_claude_md_section(
+                            repo_path, repo_identifier, commit_hash
+                        )
                     else:
                         McpConfigManager.remove_mcp_json(repo_path)
                         remove_claude_md_section(repo_path)

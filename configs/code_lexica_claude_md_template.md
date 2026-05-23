@@ -11,6 +11,10 @@ exploration and skip dead-end reads.
 
 - `repoIdentifier`: `{repo_identifier}` — pass verbatim. Short-form
   names won't resolve.
+- `commitHash`: `{commit_hash}` — pass verbatim. Pins the response to
+  the exact codebase state being worked on; the server resolves
+  task-relevant content against that snapshot rather than the latest
+  indexed state.
 - `taskPrompt`: the user prompt / task description you're currently
   working on. This drives the server-side relevance filter; without
   it you'll get an unfocused project overview instead of a
