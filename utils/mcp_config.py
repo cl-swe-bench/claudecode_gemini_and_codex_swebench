@@ -166,11 +166,13 @@ class McpConfigManager:
                         "rev-parse HEAD and pass the result as the commitHash "
                         "parameter — this pins the response to the exact "
                         "codebase state you are working against rather than the "
-                        "latest indexed state. ALSO pass the user's task prompt "
-                        "(the issue / feature description you've been asked to "
-                        "work on) as the taskPrompt parameter — this drives the "
-                        "relevance filter; without it you receive an unfocused "
-                        "project overview instead of a task-tailored view. "
+                        "latest indexed state. ALSO pass the EXACT, COMPLETE "
+                        "text of the task / issue you were given as the "
+                        "taskPrompt parameter, verbatim — do not summarize, "
+                        "paraphrase, or re-word it; this drives the relevance "
+                        "filter, which degrades on a lossy summary. Without it "
+                        "you receive an unfocused project overview instead of a "
+                        "task-tailored view. "
                         "BEFORE exploring the codebase with grep, glob, semantic "
                         "search, file reads, or explore subagents, call "
                         "get_codebase_context with all three parameters. The "
@@ -311,3 +313,134 @@ def remove_claude_md_section(task_dir: str) -> None:
         claude_md.write_text(stripped + "\n")
     else:
         claude_md.unlink()
+
+
+# ---------- PreToolUse pin-hook injection -----------------------------------
+#
+# When a run sets ``mcp_pin_task_prompt=true``, the harness pins the Code
+# Lexica ``get_codebase_context`` call's taskPrompt / repoIdentifier /
+# commitHash to its own verbatim values instead of trusting the agent to
+# reconstruct them (the agent summarizes the task at temperature, producing
+# large cross-sample drift). We do this with a Claude Code ``PreToolUse``
+# hook: ``inject_pin_hook`` writes the canonical values to
+# ``.code_lexica/pinned_params.json`` in the clone + registers the hook in
+# ``.claude/settings.json``; the hook script (``code_lexica_pin_hook.py``)
+# rewrites the tool input via ``updatedInput`` before the call dispatches.
+# Spec: cl-benchmark/docs/mcp-priming-spec.md (Amendment 2026-05-27).
+
+# Keep in sync with PINNED_PARAMS_RELPATH in utils/code_lexica_pin_hook.py.
+PINNED_PARAMS_RELPATH = ".code_lexica/pinned_params.json"
+_SETTINGS_RELPATH = ".claude/settings.json"
+# The single promoted Code Lexica tool (see the locked "narrow to one tool"
+# decision). Broaden to ``mcp__code-lexica__.*`` if more tools get surfaced.
+_PIN_HOOK_MATCHER = "mcp__code-lexica__get_codebase_context"
+_PIN_HOOK_SCRIPT = Path(__file__).parent / "code_lexica_pin_hook.py"
+_PIN_HOOK_COMMAND = f"python3 {_PIN_HOOK_SCRIPT}"
+# Stable signature for identifying OUR hook entry on idempotent re-inject /
+# removal — matches by script name, so a moved harness path still de-dupes.
+_PIN_HOOK_SIGIL = "code_lexica_pin_hook.py"
+
+
+def _is_our_pin_entry(entry: dict) -> bool:
+    if entry.get("matcher") != _PIN_HOOK_MATCHER:
+        return False
+    return any(
+        _PIN_HOOK_SIGIL in (h.get("command") or "")
+        for h in entry.get("hooks", [])
+        if isinstance(h, dict)
+    )
+
+
+def inject_pin_hook(
+    task_dir: str,
+    repo_identifier: str,
+    commit_hash: str,
+    task_prompt: str,
+) -> Path:
+    """Write the pinned params + register the PreToolUse hook.
+
+    Writes ``<task_dir>/.code_lexica/pinned_params.json`` (the verbatim
+    values the hook will force) and ensures ``<task_dir>/.claude/settings.json``
+    contains exactly one of our hook entries, preserving any other settings /
+    hooks already present. Idempotent across re-runs. Returns the settings path.
+    """
+    base = Path(task_dir)
+
+    params_path = base / PINNED_PARAMS_RELPATH
+    params_path.parent.mkdir(parents=True, exist_ok=True)
+    params_path.write_text(json.dumps({
+        "repoIdentifier": repo_identifier,
+        "commitHash": commit_hash,
+        "taskPrompt": task_prompt,
+    }, indent=2))
+
+    settings_path = base / _SETTINGS_RELPATH
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = _load_settings(settings_path)
+
+    pretooluse = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    # Drop any prior copy of our entry (idempotent + path refresh), keep others.
+    pretooluse[:] = [e for e in pretooluse if not _is_our_pin_entry(e)]
+    pretooluse.append({
+        "matcher": _PIN_HOOK_MATCHER,
+        "hooks": [{"type": "command", "command": _PIN_HOOK_COMMAND}],
+    })
+
+    settings_path.write_text(json.dumps(settings, indent=2))
+    return settings_path
+
+
+def remove_pin_hook(task_dir: str) -> None:
+    """Strip our PreToolUse entry + the pinned params file. No-op when absent.
+
+    Preserves any non-ours settings / hooks. If removing our entry leaves the
+    settings file effectively empty (only the scaffolding we created), delete
+    the file so a follow-on non-pin attempt sees a clean clone.
+    """
+    base = Path(task_dir)
+
+    params_path = base / PINNED_PARAMS_RELPATH
+    params_path.unlink(missing_ok=True)
+    # Clean up an empty .code_lexica dir we created.
+    try:
+        params_path.parent.rmdir()
+    except OSError:
+        pass  # not empty / doesn't exist — leave it
+
+    settings_path = base / _SETTINGS_RELPATH
+    if not settings_path.exists():
+        return
+    settings = _load_settings(settings_path)
+    pretooluse = settings.get("hooks", {}).get("PreToolUse")
+    if not isinstance(pretooluse, list):
+        return
+    kept = [e for e in pretooluse if not _is_our_pin_entry(e)]
+    if len(kept) == len(pretooluse):
+        return  # nothing of ours present
+    pretooluse[:] = kept
+    # Prune empty containers so we don't leave hollow scaffolding behind.
+    if not pretooluse:
+        settings["hooks"].pop("PreToolUse", None)
+    if not settings.get("hooks"):
+        settings.pop("hooks", None)
+    if settings:
+        settings_path.write_text(json.dumps(settings, indent=2))
+    else:
+        settings_path.unlink()
+
+
+def _load_settings(settings_path: Path) -> dict:
+    """Load ``.claude/settings.json`` as a dict.
+
+    Missing file → ``{}``. Unparseable file → ``{}`` as well: SWE-bench
+    clones never ship one, so the only realistic way it exists is that we
+    wrote it (valid JSON); treating a corrupt file as empty lets us recover
+    by rewriting rather than crashing an instance.
+    """
+    if not settings_path.exists():
+        return {}
+    try:
+        data = json.loads(settings_path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}

@@ -168,3 +168,17 @@ def test_remove_is_noop_when_no_sentinel_present(tmp_path):
 
     remove_claude_md_section(str(tmp_path))
     assert (tmp_path / "CLAUDE.md").read_text() == upstream
+
+
+def test_claude_md_demands_verbatim_task_prompt(tmp_path):
+    """Option C (Amendment 2026-05-27): the injected CLAUDE.md taskPrompt
+    guidance must demand a verbatim copy, not "the task you're working on"
+    (which licensed summarization). Locks the unified wording."""
+    inject_claude_md_section(str(tmp_path), REPO_ID, COMMIT)
+    body = (tmp_path / "CLAUDE.md").read_text()
+    assert "pass it **verbatim**" in body
+    # Markdown is hard-wrapped, so match within-line fragments.
+    assert "Do **not** summarize" in body
+    assert "re-word it" in body
+    # The old summarization-licensing phrasing is gone.
+    assert "task description you're currently" not in body

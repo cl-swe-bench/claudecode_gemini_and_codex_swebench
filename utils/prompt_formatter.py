@@ -184,16 +184,39 @@ Your task is to make the minimal changes to non-tests files in the {base_path} d
 Codebase context tool (call ONCE per task — share the result, don't re-fetch):
   - mcp__code-lexica__get_codebase_context — architecture, code map, conventions, PRE-FILTERED by the server to the parts relevant to your specific task. Tells you which files/directories are relevant + how they're named so you can skip dead-end reads. Call BEFORE any grep/find/Read or before delegating to a subagent.
 
-For all Code Lexica calls, pass repoIdentifier="{repo_identifier}", commitHash="{commit_hash}", and taskPrompt = the body of the <pr_description> block above. The first two pin the response to the exact repo + commit being worked on; taskPrompt drives the server-side relevance filter. All three are required for a task-tailored response.
+For all Code Lexica calls, pass repoIdentifier="{repo_identifier}", commitHash="{commit_hash}", and taskPrompt = the EXACT, COMPLETE text inside the <pr_description> block above, copied verbatim. Do NOT summarize, paraphrase, shorten, or re-word it. The first two pin the response to the exact repo + commit being worked on; taskPrompt drives the server-side relevance filter, which degrades on a lossy summary. All three are required for a task-tailored response.
 
 Follow these steps to resolve the issue:
-1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body as taskPrompt so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
+1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body verbatim as taskPrompt — copy it exactly, do not summarize or paraphrase — so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
 2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>
 3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
 4. Edit the source code of the repo to resolve the issue
 5. Rerun your reproduce script and confirm that the error is fixed!
 6. Think about edgecases and make sure your fix handles them as well
 Your thinking should be thorough and so it's fine if it's very long."""
+
+    def build_issue_description(self, instance: Dict) -> str:
+        """Return the exact ``<pr_description>`` body for an instance.
+
+        SWE-bench Pro ships ``requirements`` + ``interface`` alongside
+        ``problem_statement``; upstream Pro-os's
+        ``helper_code/create_problem_statement.py`` concatenates all
+        three. We mirror that (via ``_concat_problem_statement``) so our
+        agent sees the same contract SWE-agent does. Lite rows + older
+        snapshots lack the extra keys and fall through to just
+        ``problem_statement``.
+
+        Exposed as a method (not inlined) so callers that need the
+        verbatim task body without rendering the whole prompt — notably
+        the Code Lexica ``taskPrompt`` pin in
+        ``code_swe_agent.process_instance`` — get a value byte-identical
+        to the ``<pr_description>`` block ``format_issue`` emits.
+        """
+        return _concat_problem_statement(
+            problem_statement=instance.get("problem_statement", ""),
+            requirements=instance.get("requirements"),
+            interface=instance.get("interface"),
+        )
 
     def format_issue(
         self, instance: Dict, *, base_path: Optional[str] = None
@@ -212,18 +235,11 @@ Your thinking should be thorough and so it's fine if it's very long."""
         repo_name = instance.get("repo", "")
         problem_statement = instance.get("problem_statement", "")
         issue_title = problem_statement.split('\n')[0]
-        # SWE-bench Pro ships ``requirements`` + ``interface`` fields
-        # alongside ``problem_statement``. Upstream Pro-os's
-        # ``helper_code/create_problem_statement.py`` concatenates all
-        # three into the prompt body — mirror that here so our agent
-        # sees the same contract as SWE-agent on Pro runs. Lite rows +
-        # older dataset snapshots don't carry these keys; the helper
-        # falls through to just ``problem_statement`` unchanged.
-        issue_description = _concat_problem_statement(
-            problem_statement=problem_statement,
-            requirements=instance.get("requirements"),
-            interface=instance.get("interface"),
-        )
+        # The exact ``<pr_description>`` body (problem_statement +
+        # Requirements + interface). Single source so the pinned
+        # ``taskPrompt`` (Code Lexica hook) is byte-identical to what
+        # the agent sees here. See ``build_issue_description``.
+        issue_description = self.build_issue_description(instance)
         base_commit = instance.get("base_commit", "")
 
         # Get instance_id for tracking
