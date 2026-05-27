@@ -431,8 +431,9 @@ def test_nudge_template_byte_for_byte_matches_spec():
     """Strong regression guard for the MCP nudge template's exact
     rendered shape. The opening through the "Your task is to make the
     minimal changes to non-tests files…" line is byte-for-byte upstream
-    ``tool_use.yaml``; what follows is byte-for-byte the spec at
-    ``cl-benchmark/docs/mcp-priming-spec.md`` "Prompt nudge template".
+    ``tool_use.yaml``; what follows is the MCP nudge content per
+    ``cl-benchmark/docs/mcp-priming-spec.md`` — taskPrompt wording per the
+    2026-05-27 amendment (verbatim-copy demand, Option C).
 
     If this test breaks, MCP-nudge runs are no longer cleanly comparable
     to either upstream-baseline runs (wrapper drift) or to prior
@@ -477,10 +478,10 @@ def test_nudge_template_byte_for_byte_matches_spec():
         "Codebase context tool (call ONCE per task — share the result, don't re-fetch):\n"
         "  - mcp__code-lexica__get_codebase_context — architecture, code map, conventions, PRE-FILTERED by the server to the parts relevant to your specific task. Tells you which files/directories are relevant + how they're named so you can skip dead-end reads. Call BEFORE any grep/find/Read or before delegating to a subagent.\n"
         "\n"
-        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git", commitHash="0123456789abcdef0123456789abcdef01234567", and taskPrompt = the body of the <pr_description> block above. The first two pin the response to the exact repo + commit being worked on; taskPrompt drives the server-side relevance filter. All three are required for a task-tailored response.\n'
+        'For all Code Lexica calls, pass repoIdentifier="https://github.com/acme/widget.git", commitHash="0123456789abcdef0123456789abcdef01234567", and taskPrompt = the EXACT, COMPLETE text inside the <pr_description> block above, copied verbatim. Do NOT summarize, paraphrase, shorten, or re-word it. The first two pin the response to the exact repo + commit being worked on; taskPrompt drives the server-side relevance filter, which degrades on a lossy summary. All three are required for a task-tailored response.\n'
         "\n"
         "Follow these steps to resolve the issue:\n"
-        "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body as taskPrompt so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
+        "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body verbatim as taskPrompt — copy it exactly, do not summarize or paraphrase — so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
         "2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>\n"
         "3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error\n"
         "4. Edit the source code of the repo to resolve the issue\n"
@@ -513,3 +514,40 @@ def test_external_template_path_takes_precedence_over_nudge(tmp_path):
     assert prompt.startswith("CUSTOM PROMPT for acme/widget")
     # Nudge content does NOT appear when external template is used.
     assert "mcp__code-lexica" not in prompt
+
+
+# -------------------- Amendment 2026-05-27: taskPrompt pin + Option C --------
+
+
+def test_build_issue_description_equals_pr_description_body():
+    """The taskPrompt pin (``code_swe_agent.process_instance`` →
+    ``inject_pin_hook``) reuses ``build_issue_description``; it MUST be
+    byte-identical to the text inside the rendered ``<pr_description>``
+    block, or the pinned value diverges from what the agent sees."""
+    formatter = PromptFormatter()
+    instance = {
+        "instance_id": "x",
+        "repo": "acme/widget",
+        "base_commit": "",
+        "problem_statement": "Fix the bug.",
+        "requirements": "R1",
+        "interface": "I1",
+    }
+    body = formatter.build_issue_description(instance)
+    assert body == "Fix the bug.\n\nRequirements:\nR1\n\nNew interfaces introduced:\nI1"
+    rendered = formatter.format_issue(instance, base_path="/app")
+    assert f"<pr_description>\n{body}\n</pr_description>" in rendered
+
+
+def test_nudge_template_demands_verbatim_task_prompt():
+    """Option C: the nudge must tell the agent to pass taskPrompt verbatim
+    (not summarize). Locks the wording so a future edit can't quietly
+    re-introduce the summarization-licensing phrasing."""
+    formatter = PromptFormatter(
+        mcp_prompt_nudge=True,
+        repo_identifier="https://github.com/acme/widget.git",
+    )
+    prompt = formatter.format_issue(_basic_instance())
+    assert "copied verbatim" in prompt
+    assert "Do NOT summarize, paraphrase, shorten, or re-word it" in prompt
+    assert "the <pr_description> body verbatim as taskPrompt" in prompt

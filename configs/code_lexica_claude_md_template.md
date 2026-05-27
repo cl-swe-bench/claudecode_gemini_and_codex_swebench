@@ -15,10 +15,11 @@ exploration and skip dead-end reads.
   the exact codebase state being worked on; the server resolves
   task-relevant content against that snapshot rather than the latest
   indexed state.
-- `taskPrompt`: the user prompt / task description you're currently
-  working on. This drives the server-side relevance filter; without
-  it you'll get an unfocused project overview instead of a
-  task-tailored view.
+- `taskPrompt`: the **exact, complete** text of the task / issue you
+  were given — pass it **verbatim**. Do **not** summarize, paraphrase,
+  shorten, or re-word it. This drives the server-side relevance filter,
+  which degrades on a lossy summary; without it you'll get an unfocused
+  project overview instead of a task-tailored view.
 
 ### When to call
 

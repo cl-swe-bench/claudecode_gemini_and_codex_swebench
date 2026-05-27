@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import signal
 import sys
 import subprocess
@@ -30,7 +31,9 @@ from utils.model_registry import get_model_name
 from utils.mcp_config import (
     McpConfigManager,
     inject_claude_md_section,
+    inject_pin_hook,
     remove_claude_md_section,
+    remove_pin_hook,
 )
 
 
@@ -196,6 +199,39 @@ def _resolve_repo_identifier(repo_path: str, fallback_repo: str) -> str:
     return ""
 
 
+# Minimum Claude Code CLI version verified to honor PreToolUse ``updatedInput``
+# for MCP tool calls in headless ``-p`` mode (smoke-tested 2026-05-27). The
+# taskPrompt pin (``mcp_pin_task_prompt``) depends on that behavior.
+_PIN_HOOK_MIN_CLI_VERSION = (2, 1, 152)
+
+
+def _warn_if_claude_cli_too_old() -> None:
+    """Log a warning if the local ``claude`` CLI predates the version
+    verified to support the pin hook's ``updatedInput`` rewrite.
+
+    Soft check only — never raises. If the version can't be parsed we stay
+    quiet (the worker image pins a known-good CLI; standalone users get the
+    benefit of the doubt rather than a spurious warning).
+    """
+    try:
+        out = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+        if not m:
+            return
+        version = tuple(int(g) for g in m.groups())
+        if version < _PIN_HOOK_MIN_CLI_VERSION:
+            minv = ".".join(str(p) for p in _PIN_HOOK_MIN_CLI_VERSION)
+            print(
+                f"WARNING: mcp_pin_task_prompt requires Claude Code >= {minv} "
+                f"to rewrite the MCP taskPrompt (found {out}). Pinning may be "
+                f"silently ignored on this CLI."
+            )
+    except (subprocess.SubprocessError, OSError):
+        return
+
+
 class CodeSWEAgent:
     """Main agent for running SWE-bench using different code models."""
 
@@ -212,6 +248,7 @@ class CodeSWEAgent:
                  is_cancelled: Optional[Callable[[], bool]] = None,
                  output_format: str = "json",
                  mcp_prompt_nudge: bool = False,
+                 mcp_pin_task_prompt: bool = False,
                  mcp_debug: bool = False,
                  mcp_url_override: Optional[str] = None):
         # env_overrides + on_rate_limit_retry are Phase 4 additions. The
@@ -260,6 +297,16 @@ class CodeSWEAgent:
         # per-instance in ``process_instance`` once the cloned repo's
         # ``git remote get-url origin`` resolves.
         self.mcp_prompt_nudge = mcp_prompt_nudge and self.backend == "claude"
+        # ``mcp_pin_task_prompt`` is claude-only (the PreToolUse hook +
+        # ``.claude/settings.json`` mechanism is Claude Code-specific;
+        # codex/gemini are a Phase-7 follow-up). When on, the harness
+        # pins get_codebase_context's taskPrompt/repoIdentifier/commitHash
+        # to its verbatim values via the hook injected in
+        # ``process_instance``. See docs/mcp-priming-spec.md
+        # (Amendment 2026-05-27).
+        self.mcp_pin_task_prompt = mcp_pin_task_prompt and self.backend == "claude"
+        if self.mcp_pin_task_prompt:
+            _warn_if_claude_cli_too_old()
         self.prompt_formatter = PromptFormatter(
             prompt_template_path=prompt_template,
             mcp_prompt_nudge=self.mcp_prompt_nudge,
@@ -572,9 +619,25 @@ class CodeSWEAgent:
                         inject_claude_md_section(
                             repo_path, repo_identifier, commit_hash
                         )
+                        # Pin the Code Lexica params to our verbatim values
+                        # via a PreToolUse hook so taskPrompt doesn't drift
+                        # with the agent's summary. ``build_issue_description``
+                        # returns the exact ``<pr_description>`` body.
+                        if self.mcp_pin_task_prompt:
+                            inject_pin_hook(
+                                repo_path,
+                                repo_identifier,
+                                commit_hash,
+                                self.prompt_formatter.build_issue_description(
+                                    instance
+                                ),
+                            )
+                        else:
+                            remove_pin_hook(repo_path)
                     else:
                         McpConfigManager.remove_mcp_json(repo_path)
                         remove_claude_md_section(repo_path)
+                        remove_pin_hook(repo_path)
         except SetupTimeoutError as e:
             os.chdir(original_dir)
             msg = f"Execution failed: {e}"
@@ -876,6 +939,7 @@ def run_shard(
     is_cancelled: Optional[Callable[[], bool]] = None,
     output_format: str = "json",
     mcp_prompt_nudge: bool = False,
+    mcp_pin_task_prompt: bool = False,
     mcp_debug: bool = False,
     mcp_url_override: Optional[str] = None,
     cwd_suffix: Optional[str] = None,
@@ -932,6 +996,7 @@ def run_shard(
         is_cancelled=is_cancelled,
         output_format=output_format,
         mcp_prompt_nudge=mcp_prompt_nudge,
+        mcp_pin_task_prompt=mcp_pin_task_prompt,
         mcp_debug=mcp_debug,
         mcp_url_override=mcp_url_override,
     )
