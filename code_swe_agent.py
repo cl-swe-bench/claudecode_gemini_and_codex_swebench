@@ -199,10 +199,13 @@ def _resolve_repo_identifier(repo_path: str, fallback_repo: str) -> str:
     return ""
 
 
-# Minimum Claude Code CLI version verified to honor PreToolUse ``updatedInput``
-# for MCP tool calls in headless ``-p`` mode (smoke-tested 2026-05-27). The
-# taskPrompt pin (``mcp_pin_task_prompt``) depends on that behavior.
-_PIN_HOOK_MIN_CLI_VERSION = (2, 1, 152)
+# Minimum Claude Code CLI version we treat as supporting the PreToolUse
+# ``updatedInput`` rewrite the taskPrompt pin depends on. Aligned to the
+# cloud worker image's pinned ``CLAUDE_CODE_VERSION`` (2.1.117,
+# apps/worker/Dockerfile) so the guard doesn't false-warn in cloud. The
+# rewrite was smoke-tested on 2.1.152 (2026-05-27); 2.1.117 support is
+# being verified by the owner — keep this in lockstep with the image pin.
+_PIN_HOOK_MIN_CLI_VERSION = (2, 1, 117)
 
 
 def _warn_if_claude_cli_too_old() -> None:
