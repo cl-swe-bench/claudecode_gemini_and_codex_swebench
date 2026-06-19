@@ -351,18 +351,16 @@ def test_nudge_template_inserts_codebase_context_block():
         in prompt
     )
     # New step 1 is the MCP context fetch; upstream's "find and read
-    # code relevant to the <pr_description>" line is renumbered to step 2.
+    # code relevant to the <pr_description>" step is dropped from the
+    # nudge variant because get_codebase_context supersedes it.
     assert "1. Call mcp__code-lexica__get_codebase_context ONCE at the start" in prompt
     assert "INCLUDE the returned context in the subagent brief verbatim" in prompt
+    assert "find and read code relevant to the <pr_description>" not in prompt
     assert (
-        "2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>"
+        "2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error"
         in prompt
     )
-    assert (
-        "3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error"
-        in prompt
-    )
-    assert "6. Think about edgecases and make sure your fix handles them as well" in prompt
+    assert "5. Think about edgecases and make sure your fix handles them as well" in prompt
     # Upstream's tail is preserved.
     assert prompt.endswith(
         "Your thinking should be thorough and so it's fine if it's very long."
@@ -482,11 +480,10 @@ def test_nudge_template_byte_for_byte_matches_spec():
         "\n"
         "Follow these steps to resolve the issue:\n"
         "1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body verbatim as taskPrompt — copy it exactly, do not summarize or paraphrase — so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.\n"
-        "2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>\n"
-        "3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error\n"
-        "4. Edit the source code of the repo to resolve the issue\n"
-        "5. Rerun your reproduce script and confirm that the error is fixed!\n"
-        "6. Think about edgecases and make sure your fix handles them as well\n"
+        "2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error\n"
+        "3. Edit the source code of the repo to resolve the issue\n"
+        "4. Rerun your reproduce script and confirm that the error is fixed!\n"
+        "5. Think about edgecases and make sure your fix handles them as well\n"
         "Your thinking should be thorough and so it's fine if it's very long."
     )
     assert rendered == expected, (

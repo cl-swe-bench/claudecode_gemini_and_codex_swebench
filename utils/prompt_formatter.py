@@ -57,7 +57,7 @@ class PromptFormatter:
             prompt_template_path: Optional external template file. Overrides
                 the inline default + nudge templates when set.
             mcp_prompt_nudge: When True, swap the inline default for the
-                MCP-aware variant (Codebase context tools block + 7-step
+                MCP-aware variant (Codebase context tool block + 5-step
                 task list). cl-benchmark's run-form toggle drives this; the
                 external template path takes precedence if both are set.
                 Spec: cl-benchmark/docs/mcp-priming-spec.md.
@@ -135,8 +135,8 @@ Your thinking should be thorough and so it's fine if it's very long."""
         """MCP-aware variant of the default template — emitted when the
         caller passes ``mcp_prompt_nudge=True``.
 
-        Byte-for-byte equal to ``_default_template`` (upstream
-        ``tool_use.yaml``) with two MCP-specific insertions:
+        Equal to ``_default_template`` (upstream ``tool_use.yaml``)
+        with two MCP-specific insertions and one upstream-step deletion:
 
         * Between the "Your task is to make the minimal changes…" line
           and the "Follow these steps to resolve the issue:" line, a
@@ -145,10 +145,14 @@ Your thinking should be thorough and so it's fine if it's very long."""
           when to call it, followed by the ``repoIdentifier`` +
           ``commitHash`` directive (both required parameters that pin
           the response to the exact repo and commit being worked on).
-        * As the new first step in upstream's numbered task list, a
-          mandatory ``get_codebase_context`` call (with
-          subagent-sharing nudge to avoid redundant re-fetches).
-          Upstream's original 5 steps follow as steps 2-6, verbatim.
+        * The numbered task list is rebuilt around the MCP call: a
+          mandatory ``get_codebase_context`` step is prepended as
+          step 1 (with subagent-sharing nudge to avoid redundant
+          re-fetches), and upstream's original "find and read code
+          relevant to the <pr_description>" step is dropped because
+          ``get_codebase_context`` supersedes it. Upstream's remaining
+          4 steps (reproduce, edit, rerun, edge-cases) follow as
+          steps 2-5, verbatim.
 
         Upstream's "Your thinking should be thorough…" tail is kept;
         no "Important notes" block is added — keeping the MCP variant
@@ -188,11 +192,10 @@ For all Code Lexica calls, pass repoIdentifier="{repo_identifier}", commitHash="
 
 Follow these steps to resolve the issue:
 1. Call mcp__code-lexica__get_codebase_context ONCE at the start to fetch task-relevant codebase context. Pass the <pr_description> body verbatim as taskPrompt — copy it exactly, do not summarize or paraphrase — so the server filters to files relevant to this issue. USE the returned context to direct your subsequent reads and searches — don't ignore it and re-grep the codebase from scratch. When you delegate to a subagent, INCLUDE the returned context in the subagent brief verbatim — do not have subagents call get_codebase_context themselves; it would re-fetch the same data and bloat the conversation.
-2. As a first step, it might be a good idea to find and read code relevant to the <pr_description>
-3. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
-4. Edit the source code of the repo to resolve the issue
-5. Rerun your reproduce script and confirm that the error is fixed!
-6. Think about edgecases and make sure your fix handles them as well
+2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
+3. Edit the source code of the repo to resolve the issue
+4. Rerun your reproduce script and confirm that the error is fixed!
+5. Think about edgecases and make sure your fix handles them as well
 Your thinking should be thorough and so it's fine if it's very long."""
 
     def build_issue_description(self, instance: Dict) -> str:
